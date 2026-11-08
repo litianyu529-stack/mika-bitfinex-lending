@@ -1,6 +1,6 @@
 # Mika Lending Bot · Bitfinex USD 自动放贷
 
-[![Windows verification](https://github.com/litianyu529-stack/mika-bitfinex-lending/actions/workflows/windows-verify.yml/badge.svg?branch=main)](https://github.com/litianyu529-stack/mika-bitfinex-lending/actions/workflows/windows-verify.yml)
+[预览版 Windows CI 已通过](https://github.com/litianyu529-stack/mika-bitfinex-lending/actions/runs/42516970133)
 [![正式版](https://img.shields.io/github/v/release/litianyu529-stack/mika-bitfinex-lending?label=stable)](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -8,11 +8,13 @@
 
 *Automated Bitfinex USD funding for Windows with a local dashboard, configurable lending limits, and order reconciliation.*
 
-**[下载正式版](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/latest)** · [Windows 快速开始](#快速开始) · [反馈问题](https://github.com/litianyu529-stack/mika-bitfinex-lending/issues)
+**[下载正式版](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/latest)** · [下载 v0.3.6.1-rc.1 预览版](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/tag/v0.3.6.1-rc.1) · [Windows 快速开始](#快速开始) · [反馈问题](https://github.com/litianyu529-stack/mika-bitfinex-lending/issues)
 
 ![Mika Lending Bot 总览，显示模拟余额、资金分布和挂单状态](docs/dashboard-preview.png)
 
 *控制台总览 · 演示数据*
+
+上方正式版链接指向 v0.3.5.1。预览版包含两小时手动挂单保护和 Schema 19。
 
 - **控制资金与利率**：为三个期限池设置最低净年化，并限制可参与放贷的金额。
 - **先对账再恢复**：提交或撤单结果不明时，核对交易所记录后才继续写入。
@@ -46,6 +48,8 @@ V3.5 合并了无人值守安全恢复与精确期限定价升级；0.3.5.2 起�
 ## 快速开始
 
 运行环境：Windows、Python 3.12（CI 验证版本）和 Node.js 22（仅开发验证需要）。
+
+在所选 Release 的 Assets 中下载 `Source code (zip)`，解压后在目录中打开 PowerShell。
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -109,7 +113,7 @@ python -m pip install -r requirements-dev.txt
 .\verify.ps1
 ```
 
-验证包括 Ruff、Python 编译、311 个单元/集成测试、核心安全覆盖率、前端语法、Dashboard HTTP 关键流程和 `git diff --check`。测试通过临时 `AppContext` 隔离真实锁、默认数据库、日志和凭据，即使真实 Worker 正在运行也不会读取或写入其状态。
+验证包括 Ruff、Python 编译、单元和集成测试、核心安全覆盖率、前端语法、Dashboard HTTP 关键流程和 `git diff --check`。测试通过临时 `AppContext` 隔离真实锁、默认数据库、日志和凭据，即使真实 Worker 正在运行也不会读取或写入其状态。
 
 ## 版本与文件
 
