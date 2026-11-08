@@ -2,13 +2,17 @@ import threading
 import time
 from decimal import ROUND_DOWN
 
-from bitfinex import BitfinexAmbiguousWriteError, BitfinexApiError, currency_to_symbol
+from bitfinex import APP_VERSION, Bitfinex, BitfinexAmbiguousWriteError, BitfinexApiError, currency_to_symbol
 from DomainTypes import WriteOutcome, WriteResult
 from MarketDataStream import BitfinexMarketDataHub
+from MarketHistory import MarketHistoryService
+from V36Validation import validation_status
 from Recovery import classify_runtime_error
-from StateStore import InsufficientReservedBalance
+from StateStore import InsufficientReservedBalance, StaleStrategyVersion
 from ExchangeModels import (
+    FRR_OFFSET_OFFER_TYPES,
     extract_submitted_offer_id,
+    funding_offer_effective_rate,
     parse_book as parse_book_v3,
     parse_credit_rows as parse_credit_rows_v3,
     parse_funding_stats,
@@ -23,6 +27,7 @@ from StrategyV3 import (
     DUST_REINVEST_MINIMUM,
     EXACT_TERM_EXPLORATION_CURVE,
     EXACT_TERM_EXPLORATION_CURVES,
+    EXECUTABLE_QUICK_MODE,
     POOLS,
     SATOSHI,
     StrategyPolicyV3,
@@ -292,11 +297,15 @@ class LendingRuntimeV3:
         auto_transfer_wallets=(),
         on_policy_activated=None,
         clock=time.time,
+        history_service=None,
     ):
         self.client = client
         self.policy = validate_policy_v3(policy)
         self.store = store
         self.log = log
+        self.history = history_service
+        if self.history is None and hub is None and isinstance(client, Bitfinex):
+            self.history = MarketHistoryService(store, Bitfinex("", ""), clock=clock)
         self.hub = hub or BitfinexMarketDataHub(
             client.api_key,
             client.api_secret,
@@ -304,7 +313,10 @@ class LendingRuntimeV3:
             store=store,
             fallback_seconds=policy.ws_fallback_seconds,
             rest_stale_seconds=policy.rest_stale_seconds,
+            history_service=self.history,
         )
+        if self.history is not None:
+            self.hub.history_service = self.history
         self.auto_transfer_wallets = tuple(str(item).lower() for item in auto_transfer_wallets)
         self.on_policy_activated = on_policy_activated
         self.clock = clock
@@ -316,6 +328,40 @@ class LendingRuntimeV3:
         self._income_sync_thread = None
         self._pending_cancel_requested = set()
         self._last_dust_check_bucket = None
+        self._history_status = {"state": "UNAVAILABLE", "usable": False}
+        self._validation_status = {"approved": False, "reasons": ["V3.5 mode"]}
+
+    def _market_signals(self, snapshot, policy, now_ms=None):
+        window = None if self.history is None else self.history.snapshot(policy, now_ms)
+        # LIVE observes the window after REST and after copying the published
+        # snapshot. A cycle-start timestamp can predate that snapshot. Explicit
+        # times remain authoritative for deterministic callers and replay.
+        now = int(now_ms if now_ms is not None else self.clock() * 1000)
+        self._validation_status = validation_status(self.store, policy)
+        requested = policy.quick_pricing_mode == EXECUTABLE_QUICK_MODE
+        enabled = requested and self._validation_status["approved"]
+        signals = build_market_signals_v3(
+            snapshot["book"], snapshot["trades"], self._stats, policy, now,
+            window_snapshot=window if enabled else None,
+        )
+        signals["quickPricingEnabled"] = bool(enabled and signals.get("completeWindowUsable"))
+        reason = None
+        if not requested:
+            reason = "V35_CONFIGURED"
+        elif not enabled:
+            reason = "VALIDATION_GATE_NOT_PASSED"
+        elif not signals.get("completeWindowUsable"):
+            reason = (window or {}).get("state", "HISTORY_UNAVAILABLE")
+        self._history_status = {
+            key: value for key, value in (window or {}).items()
+            if key not in {"global", "windows", "periodDemand", "byPeriod", "periodWindows"}
+        }
+        self._history_status.update(
+            inputMode=signals["historyMode"], quickPricingMode=(
+                EXECUTABLE_QUICK_MODE if signals["quickPricingEnabled"] else "EXPLORATION_V4"
+            ), fallbackReason=reason,
+        )
+        return signals
 
     def _log(self, message):
         if self.log is not None:
@@ -453,6 +499,9 @@ class LendingRuntimeV3:
             self._log(f"已通过唯一 Bitfinex 记录自动恢复 {len(auto_resolved)} 个未知写入。")
         if start_websocket:
             self.hub.start()
+        if self.history is not None:
+            self.history.snapshot(self.policy)
+            self.history.start()
         self.start_income_history_sync()
         self._bootstrapped = True
 
@@ -462,6 +511,8 @@ class LendingRuntimeV3:
             self._income_sync_thread.join(timeout=5)
             self._income_sync_thread = None
         self.hub.stop()
+        if self.history is not None:
+            self.history.stop(timeout=5)
 
     def start_income_history_sync(self):
         if self._income_sync_thread is not None and self._income_sync_thread.is_alive():
@@ -556,12 +607,17 @@ class LendingRuntimeV3:
         now = int(now_ms if now_ms is not None else self.clock() * 1000)
         symbol = currency_to_symbol("USD")
         raw_book = self.client.funding_book(symbol, 250)
+        book_observed_at_ms = int(self.clock() * 1000)
         # The public endpoint applies ``limit`` before we build the short market
         # windows.  On busy markets an ascending seven-day query can therefore
         # contain only the oldest part of the range and silently omit the latest
         # five-minute/hour signals.  Fetch newest-first; the parser restores
         # chronological order for signal construction.
-        raw_trades = self.client.funding_trades(symbol, start=now - 7 * 86_400_000, end=now, limit=10000, sort=-1)
+        trade_read_due = self.history is None or self.history.public_read_limiter.try_acquire()
+        raw_trades = (
+            self.client.funding_trades(symbol, start=now - 7 * 86_400_000, end=now, limit=10000, sort=-1)
+            if trade_read_due else []
+        )
         raw_stats = self.client.funding_stats(symbol, start=now - 7 * 86_400_000, end=now, limit=250)
         raw_wallets = self.client.wallets()
         if self.auto_transfer_wallets and self.store.runtime()["mode"] == "LIVE":
@@ -646,7 +702,8 @@ class LendingRuntimeV3:
                 offer["pool"] = stored.get("pool") or offer.get("pool")
                 offer["layer"] = stored.get("layer") or offer.get("layer")
                 offer["display_type"] = stored.get("display_type") or offer.get("display_type")
-                if offer["managed"]:
+                protection = self.store.manual_protection_for_offer(offer, now)
+                if offer["managed"] and not (protection and protection["needsTakeover"]):
                     self.store.discard_unconfirmed_external_takeover(offer["id"])
         takeover_snapshot_safe = (
             authoritative_account["walletAvailableKnown"] and authoritative_account["reconciliationStatus"] == "MATCHED"
@@ -657,12 +714,18 @@ class LendingRuntimeV3:
             strategy_version = active_strategy["version_id"] if active_strategy else "3"
             confirmed_external = []
             for offer in offers:
-                if offer.get("managed") or str(offer.get("currency") or "USD").upper() != "USD":
+                protection = self.store.manual_protection_for_offer(offer, now)
+                if str(offer.get("currency") or "USD").upper() != "USD":
+                    continue
+                if offer.get("managed") and not (protection and protection["needsTakeover"]):
                     continue
                 takeover = self.store.observe_external_takeover(offer, now)
                 if takeover.get("state") == "CONFIRMED":
-                    confirmed_external.append(offer)
-            adopted = self.store.adopt_external_offers(confirmed_external, strategy_version)
+                    if offer.get("managed"):
+                        self.store.queue_manual_retake(offer, now)
+                    else:
+                        confirmed_external.append(offer)
+            adopted = self.store.adopt_external_offers(confirmed_external, strategy_version, now_ms=now)
             if adopted:
                 adopted_ids = set(adopted)
                 for offer in offers:
@@ -684,9 +747,11 @@ class LendingRuntimeV3:
                 credit["pool"] = stored.get("pool") or pool_for_period(credit["period"])
                 credit["layer"] = stored.get("layer")
                 credit["display_type"] = stored.get("display_type")
-        self.store.upsert_market_trades(trades)
+        if not isinstance(self.hub, BitfinexMarketDataHub):
+            # Injected adapters need not implement the unified ingestion path.
+            self.store.upsert_market_trades(trades)
         self.store.upsert_funding_stats(self._stats)
-        self.store.record_book_snapshot(book, source="REST", now_ms=now)
+        self.store.record_book_snapshot(book, source="REST", now_ms=book_observed_at_ms)
         self.hub.apply_rest_snapshot(
             book=book,
             trades=trades,
@@ -1125,6 +1190,9 @@ class LendingRuntimeV3:
             layer = offer.get("layer") or "balanced"
             if chain is None or pool not in POOLS or self.policy.floor_apr(pool) is None:
                 continue
+            observed_rate = funding_offer_effective_rate(offer, signals.get("frr_daily_rate"))
+            if observed_rate is None:
+                continue
             stage = int(chain.get("current_stage") or 0)
             curve_version = str(chain.get("pricing_curve_version") or "LEGACY")
             stages = self.policy.reprice_stages(pool, layer, curve_version)
@@ -1153,7 +1221,6 @@ class LendingRuntimeV3:
                 else max(floor_rate, min(D(chain["origin_rate"]), benchmark))
             )
             pricing = period_pricing_context(signals, pool, int(offer["period"]), floor_rate)
-            observed_rate = D(offer.get("rate_real") or offer["rate"])
             floor_gap = max(D("0"), observed_rate - floor_rate)
             landing_gap = max(D("0"), observed_rate - fixed_landing)
             final_due_at = int(chain["started_at_ms"]) + int(stages[-1]) * 60_000
@@ -1171,7 +1238,7 @@ class LendingRuntimeV3:
                 floor_state = "NOT_DUE"
             market_anchor = chain.get("market_anchor_rate")
             if market_anchor is None and stage >= 3:
-                market_anchor = offer.get("rate_real") or offer["rate"]
+                market_anchor = observed_rate
             next_target = None
             if next_stage is not None:
                 if exploration_curve:
@@ -1184,7 +1251,7 @@ class LendingRuntimeV3:
                         chain,
                         benchmark,
                         floor_rate,
-                        fallback_anchor=D(offer.get("rate_real") or offer["rate"]),
+                        fallback_anchor=observed_rate,
                         stage_count=len(stages),
                     )
             stage_type = (
@@ -1261,6 +1328,9 @@ class LendingRuntimeV3:
             now,
         )
         for offer in open_offers:
+            offer["manualProtection"] = self.store.manual_protection_for_offer(offer, now)
+            effective = funding_offer_effective_rate(offer, signals.get("frr_daily_rate"))
+            offer["dailyRatePercent"] = None if effective is None else format(effective * 100, "f")
             offer_id = int(offer.get("id") or offer.get("offer_id") or 0)
             if offer_id in repricing_by_offer:
                 offer["repriceState"] = repricing_by_offer[offer_id]
@@ -1282,7 +1352,10 @@ class LendingRuntimeV3:
             strategy_payload["periodActivity"] = json_decimal(self.store.period_activity(now - 86_400_000, "USD"))
         status = {
             "schemaVersion": 3,
-            "stateSchemaVersion": 16,
+            "stateSchemaVersion": 19,
+            "applicationVersion": APP_VERSION,
+            "marketHistory": json_decimal(self._history_status),
+            "v36Validation": json_decimal(self._validation_status),
             "operationMode": runtime["mode"],
             "runtime": runtime,
             "recovery": self.store.recovery_status(),
@@ -1321,7 +1394,7 @@ class LendingRuntimeV3:
             if runtime["mode"] == "PAUSED" and runtime.get("safe_reason"):
                 self.log.refreshStatus(f"PAUSED：{runtime.get('safe_reason') or '策略已暂停'}")
             else:
-                self.log.refreshStatus(f"V3.5 {runtime['mode']} 状态已同步。")
+                self.log.refreshStatus(f"v{APP_VERSION} {runtime['mode']} 状态已同步。")
         return status
 
     def _submit_plan(
@@ -1445,6 +1518,8 @@ class LendingRuntimeV3:
         wallet_available,
         strategy_version,
         cap_limited_available=None,
+        *,
+        frr_daily_rate=None,
     ):
         """Restore canceled offers before new wallet cash is allocated."""
 
@@ -1483,6 +1558,7 @@ class LendingRuntimeV3:
         )
         attempt_budget = max(0, MAX_FUNDING_SUBMISSIONS_PER_WINDOW - recent_attempts)
         attempts = 0
+        frr = D(frr_daily_rate or 0)
         for pending in pending_rows:
             if attempts >= attempt_budget:
                 break
@@ -1501,14 +1577,20 @@ class LendingRuntimeV3:
             display_type = str(
                 pending.get("source_display_type") or pending.get("source_offer_type") or "LIMIT"
             ).upper()
-            source_effective = D(pending.get("source_rate_real") or pending["source_rate"])
+            offer_type = str(pending.get("source_offer_type") or "LIMIT").upper()
+            if offer_type in FRR_OFFSET_OFFER_TYPES and frr <= 0:
+                continue
+            source_effective = funding_offer_effective_rate(
+                {"offer_type": offer_type, "rate": pending["source_rate"], "rate_real": pending["source_rate_real"]},
+                frr,
+            )
             row = self._apply_pending_reprice(
                 {
                     "amount": amount,
                     "pool": pool,
                     "layer": str(pending["layer"]),
                     "period": int(pending["source_period"]),
-                    "offer_type": str(pending.get("source_offer_type") or "LIMIT"),
+                    "offer_type": offer_type,
                     "display_type": display_type,
                     "flags": flags,
                     "submitted_rate": D(pending["source_rate"]),
@@ -1520,7 +1602,10 @@ class LendingRuntimeV3:
                     "remainder_absorption_pool": pool if absorbed_remainder > 0 else None,
                 },
                 pending,
+                frr,
             )
+            if rate_below_floor(row["effective_rate"], floor_rate):
+                continue
             order = {
                 **row,
                 "currency": str(pending.get("source_currency") or "USD").upper(),
@@ -1586,7 +1671,7 @@ class LendingRuntimeV3:
         return submitted, max(D("0"), remaining - outstanding)
 
     @staticmethod
-    def _apply_pending_reprice(row, pending):
+    def _apply_pending_reprice(row, pending, frr_daily_rate):
         if not pending or pending.get("pending_target_rate") is None:
             return dict(row)
         adjusted = dict(row)
@@ -1603,20 +1688,17 @@ class LendingRuntimeV3:
             adjusted["submitted_rate"] = desired
             adjusted["effective_rate"] = desired
             adjusted["target_rate"] = desired
-        elif display_type in {"FRR_DELTA_FIXED", "FRR_DELTA_VARIABLE"}:
-            frr = max(D("0"), D(adjusted["effective_rate"]) - D(adjusted["submitted_rate"]))
-            offset = ceil_rate_tick(max(D("0"), desired - frr))
+        elif adjusted["offer_type"] in FRR_OFFSET_OFFER_TYPES:
+            offset = D("0") if display_type == "FRR" else ceil_rate_tick(max(D("0"), desired - frr_daily_rate))
             adjusted["submitted_rate"] = offset
-            adjusted["effective_rate"] = frr + offset
-            adjusted["target_rate"] = desired
+            adjusted["effective_rate"] = frr_daily_rate + offset
+            adjusted["target_rate"] = adjusted["effective_rate"]
         return adjusted
 
     def _cancel_reprice_candidates(self, snapshot, plan_result, now_ms=None, strategy_version=None):
         now = int(now_ms if now_ms is not None else self.clock() * 1000)
         signals = snapshot.get("market", {})
-        target_by_key = {}
-        for row in plan_result["plan"]:
-            target_by_key.setdefault((row["pool"], row["layer"]), row)
+        frr = D(signals.get("frr_daily_rate") or 0)
         canceled = []
         offers = self.store.offers(active_only=True)
 
@@ -1643,7 +1725,11 @@ class LendingRuntimeV3:
                 int(offer["offer_id"]),
             )
 
+        protections = self.store.manual_protections(now)
         for offer in sorted(offers, key=reprice_priority):
+            protection = protections.get(int(offer["offer_id"]))
+            if protection and protection["needsTakeover"]:
+                continue
             if not offer["managed"] or offer["currency"] != "USD":
                 continue
             offer_id = int(offer["offer_id"])
@@ -1655,12 +1741,14 @@ class LendingRuntimeV3:
             layer = offer.get("layer") or "balanced"
             if pool not in POOLS:
                 continue
-            target = target_by_key.get((pool, layer))
-            chain = self.store.ensure_reprice_chain(offer, strategy_version, now)
+            is_frr = offer["offer_type"] in FRR_OFFSET_OFFER_TYPES
+            old_rate = funding_offer_effective_rate(offer, frr)
+            if old_rate is None or (is_frr and frr <= 0):
+                continue
+            chain = self.store.ensure_reprice_chain(offer, strategy_version, now, frr_daily_rate=frr)
             if chain is None or chain.get("pending_action"):
                 continue
 
-            old_rate = D(offer.get("rate_real") or offer["rate"])
             hidden = bool(int(offer.get("flags") or 0) & 64)
             fee = self.policy.hidden_fee_rate if hidden else self.policy.normal_fee_rate
             floor_rate = ceil_rate_tick(gross_daily_floor(self.policy.floor_apr(pool), fee))
@@ -1679,110 +1767,89 @@ class LendingRuntimeV3:
                     fixed_landing,
                     now,
                 )
-            if target is not None:
-                # A4 reprices the existing order in place conceptually. Ranking
-                # changes apply only to new wallet cash and must never change the
-                # term of a replacement order.
-                target = {**target, "period": int(offer["period"])}
-            if target is None:
-                target = {
-                    "display_type": str(offer.get("display_type") or self._offer_display_type(offer)).upper(),
-                    "period": int(offer["period"]),
-                    "flags": int(offer.get("flags") or 0),
-                    "effective_rate": benchmark,
-                }
-            age_threshold = self.policy.minimum_rate_change
+            # The new-cash plan ranks order types for new offers only. An existing
+            # offer keeps its type, period and flags while following its age curve.
             display_type = str(offer.get("display_type") or self._offer_display_type(offer)).upper()
-            compatible_shape = (
-                display_type == str(target["display_type"]).upper()
-                and int(offer["period"]) == int(target["period"])
-                and int(offer.get("flags") or 0) == int(target["flags"])
-            )
-
-            action = None
-            reason = None
-            stage = None
-            desired_rate = None
-            offer_age = now - int(offer.get("mts_created") or now)
-            if not compatible_shape:
-                if offer_age < self.policy.minimum_offer_minutes * 60_000:
-                    continue
-                action = "SHAPE_CHANGE"
-                reason = "shape_change_preserve_period"
-                desired_rate = ceil_rate_tick(max(floor_rate, min(old_rate, benchmark)))
+            current_stage = int(chain.get("current_stage") or 0)
+            stages = self.policy.reprice_stages(pool, layer, curve_version)
+            if current_stage >= len(stages):
+                next_stage = len(stages)
+                desired_rate = floor_rate
             else:
-                current_stage = int(chain.get("current_stage") or 0)
-                stages = self.policy.reprice_stages(pool, layer, curve_version)
-                if current_stage >= len(stages):
-                    next_stage = len(stages)
-                    desired_rate = floor_rate
-                else:
-                    next_stage = current_stage + 1
-                    due_at = int(chain["started_at_ms"]) + int(stages[next_stage - 1]) * 60_000
-                    if now < due_at:
-                        continue
-                    if not exploration_curve and next_stage > 3 and chain.get("market_anchor_rate") is None:
-                        chain = self.store.set_reprice_market_anchor(chain["chain_key"], old_rate, now)
-                    if exploration_curve:
-                        landing_stage = min(
-                            len(stages),
-                            int(
-                                self.policy.balanced_landing_stage
-                                if layer in {"quick", "balanced"}
-                                else self.policy.high_landing_stage
-                            ),
-                        )
-                        desired_rate = _exploration_age_stage_target(
-                            next_stage, chain, benchmark, floor_rate, landing_stage, len(stages)
-                        )
-                    else:
-                        desired_rate = _age_stage_target(
-                            next_stage,
-                            chain,
-                            benchmark,
-                            floor_rate,
-                            fallback_anchor=old_rate,
-                            stage_count=len(stages),
-                        )
-                if display_type == "FRR" or old_rate <= desired_rate or old_rate - desired_rate < age_threshold:
-                    if current_stage < len(stages):
-                        self.store.complete_reprice_stage(
-                            chain["chain_key"],
-                            next_stage,
-                            now,
-                            market_anchor_rate=(
-                                old_rate if not exploration_curve and next_stage == 3 else None
-                            ),
-                        )
-                        self.store.record_ownership_event(
-                            "REPRICE_STAGE_SKIPPED",
-                            offer_id=offer_id,
-                            details={
-                                "stage": next_stage,
-                                "stageType": (
-                                    "FLOOR"
-                                    if exploration_curve and next_stage > landing_stage
-                                    else "MARKET"
-                                    if exploration_curve
-                                    else _reprice_stage_type(next_stage, len(stages))
-                                ),
-                                "benchmarkRate": format(benchmark, "f"),
-                                "targetRate": format(desired_rate, "f"),
-                                "marketAnchorRate": format(
-                                    D(chain.get("market_anchor_rate") or old_rate),
-                                    "f",
-                                )
-                                if next_stage >= 3
-                                else None,
-                            },
-                        )
+                next_stage = current_stage + 1
+                due_at = int(chain["started_at_ms"]) + int(stages[next_stage - 1]) * 60_000
+                if now < due_at:
                     continue
-                action = "AGE_STAGE"
-                stage = next_stage
-                reason = f"age_stage_{stage}"
-
+                if not exploration_curve and next_stage > 3 and chain.get("market_anchor_rate") is None:
+                    chain = self.store.set_reprice_market_anchor(chain["chain_key"], old_rate, now)
+                if exploration_curve:
+                    landing_stage = min(
+                        len(stages),
+                        int(
+                            self.policy.balanced_landing_stage
+                            if layer in {"quick", "balanced"}
+                            else self.policy.high_landing_stage
+                        ),
+                    )
+                    desired_rate = _exploration_age_stage_target(
+                        next_stage, chain, benchmark, floor_rate, landing_stage, len(stages)
+                    )
+                else:
+                    desired_rate = _age_stage_target(
+                        next_stage,
+                        chain,
+                        benchmark,
+                        floor_rate,
+                        fallback_anchor=old_rate,
+                        stage_count=len(stages),
+                    )
             desired_rate = ceil_rate_tick(max(floor_rate, min(old_rate, desired_rate)))
-            final_floor_priority = action == "AGE_STAGE" and int(stage or 0) >= len(stages)
+            can_reduce_offset = True
+            if is_frr:
+                offset = ceil_rate_tick(max(D("0"), desired_rate - frr))
+                desired_rate = frr + offset
+                can_reduce_offset = offset < D(offer["rate"])
+            if (
+                not can_reduce_offset
+                or display_type == "FRR"
+                or old_rate <= desired_rate
+                or old_rate - desired_rate < self.policy.minimum_rate_change
+            ):
+                if current_stage < len(stages):
+                    self.store.complete_reprice_stage(
+                        chain["chain_key"],
+                        next_stage,
+                        now,
+                        market_anchor_rate=(
+                            old_rate if not exploration_curve and next_stage == 3 else None
+                        ),
+                    )
+                    self.store.record_ownership_event(
+                        "REPRICE_STAGE_SKIPPED",
+                        offer_id=offer_id,
+                        details={
+                            "stage": next_stage,
+                            "stageType": (
+                                "FLOOR"
+                                if exploration_curve and next_stage > landing_stage
+                                else "MARKET"
+                                if exploration_curve
+                                else _reprice_stage_type(next_stage, len(stages))
+                            ),
+                            "benchmarkRate": format(benchmark, "f"),
+                            "targetRate": format(desired_rate, "f"),
+                            "marketAnchorRate": format(
+                                D(chain.get("market_anchor_rate") or old_rate),
+                                "f",
+                            )
+                            if next_stage >= 3
+                            else None,
+                        },
+                    )
+                continue
+            stage = next_stage
+            reason = f"age_stage_{stage}"
+            final_floor_priority = stage >= len(stages)
             if (
                 not final_floor_priority
                 and self.store.reprice_count_since(now - 3_600_000) >= self.policy.max_reprices_per_hour
@@ -1795,6 +1862,8 @@ class LendingRuntimeV3:
                 last_family_reprice is not None
                 and now - int(last_family_reprice) < self.policy.reprice_cooldown_minutes * 60_000
             ):
+                continue
+            if not self._manual_cancel_allowed(offer, now):
                 continue
             write = _write_result(self.client, "cancel_funding_offer_result", "cancel_funding_offer", offer_id)
             if write.outcome == WriteOutcome.UNKNOWN:
@@ -1816,13 +1885,13 @@ class LendingRuntimeV3:
                 continue
             self.store.mark_reprice_pending(
                 chain["chain_key"],
-                action,
+                "AGE_STAGE",
                 desired_rate,
                 stage=stage,
                 now_ms=now,
                 market_anchor_rate=(
                     desired_rate
-                    if action == "AGE_STAGE" and stage == 3 and not exploration_curve
+                    if stage == 3 and not exploration_curve
                     else None
                 ),
                 source_offer_id=offer_id,
@@ -1834,7 +1903,7 @@ class LendingRuntimeV3:
                 desired_rate,
                 strategy_version=strategy_version,
                 plan_hash=plan_result.get("plan_hash"),
-                display_type=target.get("display_type"),
+                display_type=display_type,
                 chain_key=chain["chain_key"],
                 stage=stage,
                 benchmark_rate=benchmark,
@@ -1843,62 +1912,37 @@ class LendingRuntimeV3:
             canceled.append(offer_id)
             self._pending_cancel_requested.add(offer_id)
             self.store.record_ownership_event("CANCEL_CONFIRMED", offer_id=offer_id, details={"reason": reason})
-            if action == "AGE_STAGE":
-                self._log(
-                    f"挂单 {offer_id} 累计等待达到第 {stage} 阶段，"
-                    f"利率由 {format(old_rate, 'f')} 调整为 {format(desired_rate, 'f')}。"
-                )
-            else:
-                self._log(f"挂单 {offer_id} 的期限或类型需要按当前策略调整。")
+            self._log(
+                f"挂单 {offer_id} 累计等待达到第 {stage} 阶段，"
+                f"利率由 {format(old_rate, 'f')} 调整为 {format(desired_rate, 'f')}。"
+            )
         return canceled
 
-    @staticmethod
-    def ratio_rebalance_candidates(offers, plan_result, policy, now_ms, pending_ids=None):
-        # V3.1 converges passively: an overweight pool or term receives no new
-        # money, but ranking/cap drift alone never cancels a valid existing offer.
-        return []
+    def _manual_cancel_allowed(self, offer, now_ms, allow_retake=False, safety=False):
+        from ManualProtection import parameter_digest
 
-    def _cancel_ratio_rebalance(self, plan_result, now_ms, strategy_version):
-        if self.store.reprice_count_since(now_ms - 3_600_000) >= self.policy.max_reprices_per_hour:
-            return []
-        candidates = self.ratio_rebalance_candidates(
-            self.store.offers(active_only=True), plan_result, self.policy, now_ms, self._pending_cancel_requested
-        )
-        canceled = []
-        remaining_limit = max(0, self.policy.max_reprices_per_hour - self.store.reprice_count_since(now_ms - 3_600_000))
-        for offer in candidates[: min(10, remaining_limit)]:
-            offer_id = int(offer["offer_id"])
-            write = _write_result(self.client, "cancel_funding_offer_result", "cancel_funding_offer", offer_id)
-            if write.outcome == WriteOutcome.UNKNOWN:
-                self.store.record_ownership_event(
-                    "CANCEL_UNKNOWN",
-                    offer_id=offer_id,
-                    details={"reason": "ratio_rebalance", "error": write.error},
-                )
-                self.store.enter_protected_pause(f"AMBIGUOUS_CANCEL:{offer_id}")
-                self._log(f"撤销 Offer {offer_id} 结果未知，将自动对账后重试：{write.error}")
-                break
-            if write.outcome == WriteOutcome.DEFINITE_REJECT:
-                self.store.record_ownership_event(
-                    "CANCEL_REJECTED", offer_id=offer_id, details={"reason": "ratio_rebalance", "error": write.error}
-                )
-                continue
-            self.store.record_reprice(
-                offer_id,
-                "ratio_rebalance",
-                offer.get("rate_real") or offer["rate"],
-                None,
-                created_at_ms=now_ms,
-                strategy_version=strategy_version,
-                plan_hash=plan_result.get("plan_hash"),
-                display_type=offer.get("display_type"),
-            )
-            self.store.record_ownership_event(
-                "CANCEL_CONFIRMED", offer_id=offer_id, details={"reason": "ratio_rebalance"}
-            )
-            self._pending_cancel_requested.add(offer_id)
-            canceled.append(offer_id)
-        return canceled
+        offer_id = int(offer.get("id") or offer.get("offer_id"))
+        latest = offer
+        read = getattr(type(self.client), "active_funding_offers", None)
+        if callable(read):
+            try:
+                rows = parse_offer_rows_v3(self.client.active_funding_offers("fUSD"))
+            except Exception as exc:
+                self._log(f"撤单前无法核对挂单 {offer_id}，本轮跳过：{exc}")
+                return False
+            latest = next((row for row in rows if int(row["id"]) == offer_id), None)
+            if latest is None:
+                return False
+        now_ms = max(now_ms, int(self.clock() * 1000))
+        latest = dict(latest, managed=bool(offer.get("managed")))
+        protection = self.store.observe_manual_offer(latest, now_ms)
+        if parameter_digest(latest) != parameter_digest(offer):
+            return False  # Rebuild safety/allocation decisions against the new parameters.
+        if safety:
+            return True
+        if protection and (protection["protected"] or (protection["needsTakeover"] and not allow_retake)):
+            return False
+        return True
 
     def _cancel_external_takeovers(self, now_ms, strategy_version, plan_hash=None):
         """Cancel only explicitly adopted external offers before global replanning."""
@@ -1915,6 +1959,8 @@ class LendingRuntimeV3:
                 self.store.update_external_takeover(offer_id, "CLOSED", now_ms=now_ms)
                 continue
             if offer_id in self._pending_cancel_requested:
+                continue
+            if not self._manual_cancel_allowed(offer, now_ms, allow_retake=True):
                 continue
             result = _write_result(self.client, "cancel_funding_offer_result", "cancel_funding_offer", offer_id)
             if result.outcome == WriteOutcome.UNKNOWN:
@@ -1940,6 +1986,7 @@ class LendingRuntimeV3:
             self.store.record_ownership_event(
                 "CANCEL_CONFIRMED", offer_id=offer_id, details={"reason": "external_takeover"}
             )
+            self.store.finish_manual_protection(offer_id, "external_takeover", now_ms)
             self.store.update_external_takeover(offer_id, "CANCELLING", now_ms=now_ms)
             self._pending_cancel_requested.add(offer_id)
             canceled.append(offer_id)
@@ -2122,7 +2169,10 @@ class LendingRuntimeV3:
         if self.store.reprice_count_since(now_ms - 3_600_000) >= self.policy.max_reprices_per_hour:
             return {"blocking": False, "state": "RATE_LIMITED", "canceled": [], "submitted": []}
         candidates = []
+        protections = self.store.manual_protections(now_ms)
         for offer in active_offers.values():
+            if (protections.get(int(offer["offer_id"])) or {}).get("needsTakeover"):
+                continue
             display = str(offer.get("display_type") or offer.get("offer_type") or "LIMIT").upper()
             age = now_ms - int(offer.get("mts_created") or now_ms)
             amount = D(offer["amount"])
@@ -2160,6 +2210,8 @@ class LendingRuntimeV3:
         source_chain = self.store.ensure_reprice_chain(candidate, strategy_version, now_ms)
         if source_chain is None or source_chain.get("pending_action"):
             return {"blocking": False, "state": "NO_CHAIN", "canceled": [], "submitted": []}
+        if not self._manual_cancel_allowed(candidate, now_ms):
+            return {"blocking": False, "state": "MANUAL_PROTECTED", "canceled": [], "submitted": []}
         self.store.begin_consolidation(
             offer_id,
             wallet,
@@ -2204,15 +2256,17 @@ class LendingRuntimeV3:
         self._pending_cancel_requested.add(offer_id)
         return {"blocking": True, "state": "CANCELLING", "canceled": [offer_id], "submitted": []}
 
-    def _pending_adjustments(self, snapshot, account, pending_policy, pending_result, now_ms):
+    def _pending_adjustments(self, signals, account, pending_policy, pending_result, now_ms):
         """Return hard incompatibilities that must disappear before activation.
 
         These checks intentionally do not use the ordinary reprice age/cooldown.
         A PENDING policy is a safety boundary, not a market-timing suggestion.
         """
         adjustments = []
+        confirmed_external = {int(row["offer_id"]) for row in self.store.external_takeovers(states={"CONFIRMED"})}
         managed_offers = [
-            row for row in self.store.offers(active_only=True) if row["managed"] and row["currency"] == "USD"
+            row for row in self.store.offers(active_only=True)
+            if row["currency"] == "USD" and (row["managed"] or row["offer_id"] in confirmed_external)
         ]
         cap_excess = max(
             D("0"),
@@ -2224,7 +2278,8 @@ class LendingRuntimeV3:
             is_hidden = bool(int(offer.get("flags") or 0) & 64)
             fee = pending_policy.hidden_fee_rate if is_hidden else pending_policy.normal_fee_rate
             floor_apr = pending_policy.floor_apr(pool) if pool in POOLS else None
-            effective = D(offer.get("rate_real") or offer["rate"])
+            effective = funding_offer_effective_rate(offer, signals.get("frr_daily_rate"))
+            offer["effective_rate"] = effective
             reasons = []
             if not self._display_type_enabled(pending_policy, display_type):
                 reasons.append("disabled_type")
@@ -2232,7 +2287,8 @@ class LendingRuntimeV3:
                 reasons.append("hidden_disabled")
             if pool not in POOLS or int(offer["period"]) not in pending_policy.periods(pool):
                 reasons.append("period_not_allowed")
-            if floor_apr is not None and rate_below_floor(effective, gross_daily_floor(floor_apr, fee)):
+            if (floor_apr is not None and effective is not None
+                    and rate_below_floor(effective, gross_daily_floor(floor_apr, fee))):
                 reasons.append("below_new_floor")
             if reasons:
                 adjustments.append((offer, None, "+".join(reasons)))
@@ -2262,6 +2318,14 @@ class LendingRuntimeV3:
             offer_id = int(offer["offer_id"])
             if offer_id in self._pending_cancel_requested:
                 continue
+            if not self._manual_cancel_allowed(offer, now_ms, safety=True):
+                continue
+            if not offer["managed"]:
+                adopted = self.store.adopt_external_offers(
+                    [dict(offer, id=offer_id)], strategy_version or "3", now_ms=now_ms, safety_reason=reason
+                )
+                if not adopted:
+                    continue
             write = _write_result(self.client, "cancel_funding_offer_result", "cancel_funding_offer", offer_id)
             if write.outcome == WriteOutcome.UNKNOWN:
                 self.store.record_ownership_event(
@@ -2283,13 +2347,14 @@ class LendingRuntimeV3:
             self.store.record_reprice(
                 offer_id,
                 f"{reason_prefix}:{reason}",
-                offer.get("rate_real") or offer["rate"],
+                offer.get("effective_rate", funding_offer_effective_rate(offer)),
                 None if target is None else target["effective_rate"],
                 created_at_ms=now_ms,
                 strategy_version=strategy_version,
                 plan_hash=plan_hash,
                 display_type=(offer.get("display_type") or self._offer_display_type(offer)),
             )
+            self.store.finish_manual_protection(offer_id, f"{reason_prefix}:{reason}", now_ms)
             self._pending_cancel_requested.add(offer_id)
             self.store.record_ownership_event(
                 "CANCEL_CONFIRMED", offer_id=offer_id, details={"reason": f"{reason_prefix}:{reason}"}
@@ -2298,7 +2363,7 @@ class LendingRuntimeV3:
             canceled.append(offer_id)
         return canceled
 
-    def _advance_pending_strategy(self, snapshot, account, signals, now_ms):
+    def _advance_pending_strategy(self, snapshot, account, signals, now_ms, *, refresh_market_clock=False):
         pending = self.store.strategy("PENDING")
         if pending is None:
             return None
@@ -2306,17 +2371,26 @@ class LendingRuntimeV3:
             policy_v3_with_overrides(StrategyPolicyV3(), pending["policy"]),
             require_live_floors=True,
         )
-        pending_signals = build_market_signals_v3(
-            snapshot["book"], snapshot["trades"], self._stats, pending_policy, now_ms
+        v36_details = None
+        if pending_policy.quick_pricing_mode == EXECUTABLE_QUICK_MODE:
+            gate = validation_status(self.store, pending_policy)
+            if not gate["approved"]:
+                return {"pending": True, "blockedReason": "V36_VALIDATION_REQUIRED", "validation": gate}
+            v36_details = {"strategyVersion": pending["version_id"], "reportDigest": gate["reportDigest"]}
+        pending_signals = self._market_signals(
+            snapshot, pending_policy, None if refresh_market_clock else now_ms
         )
         self._persist_period_selection(pending_signals, pending["version_id"], now_ms)
         pending_result = self._build_plan(account, pending_policy, pending_signals, pending["version_id"])
-        adjustments = self._pending_adjustments(snapshot, account, pending_policy, pending_result, now_ms)
+        adjustments = self._pending_adjustments(pending_signals, account, pending_policy, pending_result, now_ms)
         if not adjustments:
-            self.store.activate_pending_strategy(
-                plan_hash=pending_result.get("plan_hash"),
-                reason="incompatible offers confirmed absent",
-            )
+            try:
+                self.store.activate_pending_strategy(
+                    pending["version_id"], plan_hash=pending_result.get("plan_hash"),
+                    reason="incompatible offers confirmed absent", v36_details=v36_details,
+                )
+            except StaleStrategyVersion:
+                return {"pending": True, "blockedReason": "PREVIEW_STALE"}
             self.policy = pending_policy
             self._apply_policy_runtime_settings()
             if self.on_policy_activated is not None:
@@ -2326,6 +2400,9 @@ class LendingRuntimeV3:
                     self._log(f"V3 ACTIVE 已切换，但配置镜像写入失败：{exc}")
             self._log(f"v3 策略 {pending['version_id']} 已完成调整并生效。")
             return {"activated": pending["version_id"], "pending": False, "signals": pending_signals}
+        latest = self.store.strategy("PENDING")
+        if latest is None or latest["version_id"] != pending["version_id"]:
+            return {"pending": True, "blockedReason": "PREVIEW_STALE"}
         canceled = self._cancel_hard_adjustments(
             adjustments,
             now_ms,
@@ -2339,6 +2416,7 @@ class LendingRuntimeV3:
             "remainingAdjustments": max(0, len(adjustments) - len(canceled)),
             "canceled": canceled,
             "signals": pending_signals,
+            "plan": pending_result,
         }
 
     def cycle(self, now_ms=None):
@@ -2373,8 +2451,13 @@ class LendingRuntimeV3:
                 self._log(f"v3 REST 同步失败：{exc}")
         else:
             snapshot = self.hub.snapshot(now)
+        if now_ms is None:
+            now = int(self.clock() * 1000)
+            snapshot = self.hub.snapshot(now)
         if snapshot["safeRequired"]:
             self.store.enter_protected_pause("MARKET_DATA_STALE")
+        for offer in snapshot.get("offers", []):
+            self.store.observe_manual_offer(offer, now)
         account = self._account(snapshot)
         runtime = self.store.runtime()
         if runtime["mode"] == "LIVE" and account["reconciliationStatus"] != "MATCHED":
@@ -2384,22 +2467,23 @@ class LendingRuntimeV3:
                 else "ACCOUNT_RECONCILIATION_MISMATCH"
             )
             self.store.enter_protected_pause(reason)
-        signals = build_market_signals_v3(snapshot["book"], snapshot["trades"], self._stats, self.policy, now)
+        signals_policy = self.policy
+        signals = self._market_signals(snapshot, signals_policy, None if now_ms is None else now)
         self.store.record_market_bars(signals.get("windows"), now)
         self._record_variable_floor_violations(now)
         runtime = self.store.runtime()
         resume_barrier = self.store.consume_resume_barrier()
         if runtime["mode"] == "LIVE" and not resume_barrier:
             validate_policy_v3(self.policy, require_live_floors=True)
-            pending_status = self._advance_pending_strategy(snapshot, account, signals, now)
+            pending_status = self._advance_pending_strategy(
+                snapshot, account, signals, now, refresh_market_clock=now_ms is None
+            )
             if pending_status and pending_status.get("pending"):
-                pending = self.store.strategy("PENDING")
-                pending_policy = validate_policy_v3(
-                    policy_v3_with_overrides(StrategyPolicyV3(), pending["policy"]),
-                    require_live_floors=True,
-                )
                 signals = pending_status.get("signals") or signals
-                result = self._build_plan(account, pending_policy, signals, pending["version_id"])
+                result = pending_status.pop("plan", None)
+                if result is None:
+                    active = self.store.strategy("ACTIVE")
+                    result = self._build_plan(account, self.policy, signals, active["version_id"] if active else "3")
                 result["pendingStrategy"] = pending_status
                 result["submitted"] = []
                 canceled = pending_status.get("canceled", [])
@@ -2414,7 +2498,11 @@ class LendingRuntimeV3:
                     )
                     self._apply_policy_runtime_settings()
                 version = strategy["version_id"] if strategy else "3"
-                signals = build_market_signals_v3(snapshot["book"], snapshot["trades"], self._stats, self.policy, now)
+                if self.policy != signals_policy:
+                    if pending_status and pending_status.get("activated"):
+                        signals = pending_status["signals"]
+                    else:
+                        signals = self._market_signals(snapshot, self.policy, None if now_ms is None else now)
                 self._persist_period_selection(signals, version, now)
                 result = self._build_plan(account, self.policy, signals, version)
                 canceled = self._cancel_external_takeovers(now, version, result.get("plan_hash"))
@@ -2425,7 +2513,7 @@ class LendingRuntimeV3:
                     canceled = dust.get("canceled", [])
                     result["dustConsolidation"] = dust
                 if not canceled and not dust.get("blocking"):
-                    hard_adjustments = self._pending_adjustments(snapshot, account, self.policy, result, now)
+                    hard_adjustments = self._pending_adjustments(signals, account, self.policy, result, now)
                     canceled = self._cancel_hard_adjustments(
                         hard_adjustments,
                         now,
@@ -2434,13 +2522,9 @@ class LendingRuntimeV3:
                         plan_hash=result.get("plan_hash"),
                     )
                     if not hard_adjustments:
-                        canceled = self._cancel_ratio_rebalance(result, now, version)
-                        result["rebalance_cancellations"] = canceled
-                        result["rebalanceCancellations"] = canceled
-                        if not canceled:
-                            canceled = self._cancel_reprice_candidates(
-                                {"market": signals}, result, now, strategy_version=version
-                            )
+                        canceled = self._cancel_reprice_candidates(
+                            {"market": signals}, result, now, strategy_version=version
+                        )
                 if not canceled and not dust.get("blocking") and self.store.runtime()["mode"] == "LIVE":
                     # Requested hard cancellations remain blocking until a fresh
                     # authoritative account snapshot confirms the offers vanished.
@@ -2451,6 +2535,7 @@ class LendingRuntimeV3:
                             account["wallet"],
                             version,
                             result.get("cap_limited_available"),
+                            frr_daily_rate=signals.get("frr_daily_rate"),
                         )
                         result["submitted"] = replacement_submitted + self._submit_plan(
                             result, new_cash_available, version

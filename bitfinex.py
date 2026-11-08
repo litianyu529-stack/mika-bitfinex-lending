@@ -11,7 +11,7 @@ from urllib import error, parse, request
 from DomainTypes import WriteOutcome, WriteResult
 
 
-APP_VERSION = "0.3.5.2"
+APP_VERSION = "0.3.6.1-rc.1"
 
 
 class BitfinexApiError(Exception):
@@ -149,7 +149,7 @@ class Bitfinex:
         if data is not None:
             data_bytes = data.encode("utf-8")
         request_headers = {
-            "User-Agent": f"Bitfinex-lendingbot/{APP_VERSION} Python",
+            "User-Agent": f"MikaLendingBot/{APP_VERSION} Python",
             "Accept": "application/json",
         }
         request_headers.update(headers or {})

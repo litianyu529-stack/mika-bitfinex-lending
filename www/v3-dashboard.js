@@ -41,7 +41,7 @@
         },
         {
             title: "订单类型与费用",
-            description: "V3.5 自动识别并安全接管外部 fUSD 挂单；接管前需两次权威快照确认，之后只按具体 Offer ID 撤销并重新规划。",
+            description: "自动识别并安全接管外部 fUSD 挂单；接管前需两次权威快照确认，之后只按具体 Offer ID 撤销并重新规划。",
             fields: [
                 ["enable_limit", "LIMIT", "checkbox", "", {}],
                 ["enable_frr", "FRR", "checkbox", "", {}],
@@ -59,7 +59,9 @@
             details: true,
             fields: [
                 ["minimum_offer_minutes", "最短挂单时间", "number", "分钟", { min: 1 }],
-                ["balanced_start_premium_percent", "快速/平衡层起始溢价", "number", "%（相对底线）", { min: 0, max: 100, step: 0.1 }],
+                ["quick_pricing_mode", "快速层报价模式", "select", "通过验收后启用", {}],
+                ["quick_start_premium_apr_points", "快速层净年化溢价", "number", "百分点", { min: 0, max: 1, step: 0.01 }],
+                ["balanced_start_premium_percent", "平衡层／旧快速层起始溢价", "number", "%（相对底线）", { min: 0, max: 100, step: 0.1 }],
                 ["high_start_premium_percent", "高收益层起始溢价", "number", "%（相对底线）", { min: 0, max: 100, step: 0.1 }],
                 ["balanced_landing_stage", "快速/平衡层落点阶段", "number", "阶段", { min: 1, max: 10, step: 1 }],
                 ["high_landing_stage", "高收益层落点阶段", "number", "阶段", { min: 1, max: 10, step: 1 }],
@@ -97,9 +99,16 @@
     function createField([name, label, type, unit, options]) {
         const wrapper = document.createElement("label");
         wrapper.className = type === "checkbox" ? "v3-check" : "v3-field";
-        const input = document.createElement("input");
+        const input = document.createElement(type === "select" ? "select" : "input");
         input.name = name;
-        input.type = type;
+        if (type === "select") {
+            for (const [value, label] of [["EXPLORATION_V4", "V3.5 原机制"], ["EXECUTABLE_PREMIUM_V1", "V3.6 可成交参考价＋溢价"]]) {
+                const option = document.createElement("option");
+                option.value = value;
+                option.textContent = label;
+                input.append(option);
+            }
+        } else input.type = type;
         for (const [key, value] of Object.entries(options || {})) {
             if (["floor"].includes(key)) continue;
             if (typeof value === "boolean") {
@@ -147,6 +156,8 @@
                 <div><span>账户快照</span><strong id="v3AccountSource">--</strong></div>
                 <div><span>市场行情</span><strong id="v3MarketSource">--</strong></div>
                 <div><span>市场状态</span><strong id="v3Regime">--</strong></div>
+                <div><span>行情机制</span><strong id="v3HistoryMode">--</strong></div>
+                <div><span>候选验收</span><strong id="v3Validation">--</strong></div>
                 <div class="v3-mode-actions">
                     <button id="v3PauseButton" class="button secondary" type="button">暂停</button>
                     <button id="v3ReplayButton" class="button secondary" type="button">回放</button>
@@ -173,7 +184,7 @@
         const form = byId("v3StrategyForm");
         const fixedSafety = document.createElement("p");
         fixedSafety.className = "v3-fixed-safety";
-        fixedSafety.textContent = "V3.5 固定规则：需求 70%＋成交概率 30% · 低需求 5% 连续两周期确认 · 池内分配 100/0、90/10、75/25、60/40 · 最低订单 150 USD · 余额满 1 USD 自动合并复投。";
+        fixedSafety.textContent = "固定规则：需求 70%＋成交概率 30% · 低需求 5% 连续两周期确认 · 池内分配 100/0、90/10、75/25、60/40 · 最低订单 150 USD · 余额满 1 USD 自动合并复投。";
         form.append(fixedSafety);
         for (const group of groups) {
             const section = document.createElement(group.details ? "details" : "section");
@@ -231,6 +242,8 @@
         for (const name of allFields) {
             const element = input(name);
             let value = policy?.[name];
+            if (name === "quick_pricing_mode" && value == null) value = "EXPLORATION_V4";
+            if (name === "quick_start_premium_apr_points" && value == null) value = "0.10";
             if (listFields.has(name) && Array.isArray(value)) {
                 value = periodFields.has(name) ? value.join(",") : value.join(" / ");
             }
@@ -238,6 +251,8 @@
             else element.value = value ?? "";
         }
         input("hidden_max_share").disabled = !input("enable_hidden").checked;
+        input("quick_pricing_mode").disabled = !("quick_pricing_mode" in (policy || {}));
+        input("quick_start_premium_apr_points").disabled = input("quick_pricing_mode").disabled;
         state.dirty = false;
         updateDerived();
     }
@@ -267,6 +282,10 @@
         for (const name of ["balanced_start_premium_percent", "high_start_premium_percent"]) {
             const value = numberValue(name);
             if (value < 0 || value > 100) throw new Error("起始溢价必须在 0–100% 之间");
+        }
+        const quickPremium = numberValue("quick_start_premium_apr_points");
+        if (!Number.isFinite(quickPremium) || quickPremium < 0 || quickPremium > 1) {
+            throw new Error("快速层溢价须在 0–1 个净年化百分点之间");
         }
         for (const name of ["balanced_landing_stage", "high_landing_stage"]) {
             const value = numberValue(name);
@@ -458,6 +477,15 @@
             status?.strategyV3?.periodActivity,
         );
         byId("v3MarketSource").textContent = `${marketData.source || "--"}${marketData.publicAgeMs != null ? ` · ${marketData.publicAgeMs}ms` : ""}`;
+        const history = status?.marketHistory || {};
+        const fallbackLabels = {
+            V35_CONFIGURED: "配置使用原机制", VALIDATION_GATE_NOT_PASSED: "候选未通过验收",
+            WARMING: "七天统计恢复中", BACKFILLING: "七天覆盖核验中", STALE: "统计已过期",
+            DEGRADED: "行情核验失败", HISTORY_UNAVAILABLE: "行情统计不可用",
+        };
+        byId("v3HistoryMode").textContent = history.inputMode === "COMPLETE_WINDOW"
+            ? "完整七天／分期限" : `V3.5 · ${fallbackLabels[history.fallbackReason] || history.fallbackReason || "等待新状态"}`;
+        byId("v3Validation").textContent = status?.v36Validation?.approved ? "通过" : "未通过／保持原机制";
         if (status?.last_update) byId("v3AccountSource").textContent = `实时账户 · ${status.last_update}`;
         if (market.regime) byId("v3Regime").textContent = market.regime;
         if (market.frr_daily_rate != null) byId("v3Frr").textContent = percentDaily(market.frr_daily_rate);
@@ -479,6 +507,9 @@
                 AMBIGUOUS: "小额复投写入待安全对账",
             };
             byId("v3FormMessage").textContent = labels[dust.state] || `小额复投：${dust.state}`;
+        } else if ((status?.openOffers || []).some((offer) => offer.manualProtection?.protected)) {
+            const count = status.openOffers.filter((offer) => offer.manualProtection?.protected).length;
+            byId("v3FormMessage").textContent = `手动挂单保护中：${count} 笔 · 两小时后接管剩余挂单 · 安全规则可提前处理`;
         } else if (activeTakeovers.length) {
             byId("v3FormMessage").textContent = `外部挂单接管中：${activeTakeovers.length} 笔`;
         }

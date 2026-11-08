@@ -174,7 +174,7 @@ def build_strategy_settings(extra_bot=None):
 
 class BitfinexBotTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual(APP_VERSION, "0.3.5.2")
+        self.assertEqual(APP_VERSION, "0.3.6.1-rc.1")
 
     def test_auth_headers_signature(self):
         client = Bitfinex("key", "secret")
@@ -464,11 +464,13 @@ class BitfinexBotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             html = os.path.join(directory, "lendingbot.html")
             with open(html, "wb") as file:
-                file.write(b"<meta content='__MIKA_DASHBOARD_BUILD_ID__'>")
+                file.write(b"<meta content='__MIKA_DASHBOARD_BUILD_ID__'><title>v__MIKA_APPLICATION_VERSION__</title>")
             snapshot = lendingbot.load_dashboard_static_snapshot(directory, "build-one")
             with open(html, "wb") as file:
                 file.write(b"changed-on-disk")
             self.assertIn(b"build-one", snapshot["lendingbot.html"])
+            self.assertIn(lendingbot.APP_VERSION.encode("ascii"), snapshot["lendingbot.html"])
+            self.assertNotIn(b"__MIKA_APPLICATION_VERSION__", snapshot["lendingbot.html"])
             self.assertNotIn(b"changed-on-disk", snapshot["lendingbot.html"])
 
     def test_active_schema_normalization_backs_up_and_audits(self):
@@ -581,7 +583,7 @@ class BitfinexBotTests(unittest.TestCase):
             finally:
                 FakePreflightClient.wallet_rows = original
 
-    def test_preflight_confirmed_external_offer_is_adopted_once(self):
+    def test_preflight_does_not_adopt_protected_external_offer(self):
         now_ms = 2_000_000_000_000
 
         class ExternalOfferClient(FakePreflightClient):
@@ -623,13 +625,13 @@ class BitfinexBotTests(unittest.TestCase):
                 config.write(target)
             context = lendingbot.AppContext.for_project(directory, config_path=path, client_factory=ExternalOfferClient)
             response = lendingbot.create_controlled_bot_preflight(path, now=2000, context=context)
-            assert [row["id"] for row in response["summary"]["externalAdoptionCandidates"]] == [9001]
+            assert response["summary"]["externalAdoptionCandidates"] == []
             consumed = lendingbot.consume_controlled_bot_preflight(
                 path, response["preflightId"], now=2001, context=context
             )
             store, _ = lendingbot.v3_store_for_config(path)
-            assert consumed["adoptedOfferIds"] == [9001]
-            assert store.offers(active_only=True)[0]["managed"] == 1
+            assert consumed["adoptedOfferIds"] == []
+            assert store.offers(active_only=True) == []
 
     def test_legacy_status_never_exposes_balance(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -767,9 +769,9 @@ class BitfinexBotTests(unittest.TestCase):
             config_path = os.path.join(directory, "test.cfg")
             context = lendingbot.AppContext.for_project(directory, config_path=config_path)
             store = lendingbot.LendingStateStore(os.path.join(directory, "state.sqlite3"))
-            store.save_strategy({"name": "active"}, "ACTIVE")
-            store.save_strategy({"name": "replacement"}, "DRAFT")
-            store.promote_draft_to_pending()
+            active = store.save_strategy({"name": "active"}, "ACTIVE")
+            draft = store.save_strategy({"name": "replacement"}, "DRAFT")
+            store.apply_confirmed_draft(draft, active, queue=True)
             with (
                 mock.patch.object(lendingbot, "v3_store_for_config", return_value=(store, mock.Mock())),
                 mock.patch.object(lendingbot, "controlled_bot_running", return_value=False),
@@ -820,6 +822,52 @@ class BitfinexBotTests(unittest.TestCase):
             self.assertEqual(payload["process"]["stopReason"], "dashboard_started_without_live_process")
             self.assertEqual(payload["lastStopReason"], "dashboard_started_without_live_process")
             self.assertIn("控制台启动时未发现实盘进程", payload["last_status"])
+
+    def test_dashboard_poll_uses_worker_statistics_without_history_queries(self):
+        published = {
+            "schemaVersion": 3,
+            "operationMode": "LIVE",
+            "last_update": "2026-10-12 15:00:00",
+            "account": {"total": "123", "walletAvailableKnown": True},
+            "statistics": {"30d": {"netInterest": "9.87"}},
+            "realizedIncome": {"total": "12.34"},
+            "incomeHistorySync": {"currency": "USD"},
+        }
+        store = mock.Mock()
+        store.runtime.return_value = {"mode": "PAUSED", "safe_reason": "manual_pause"}
+        store.recovery_status.return_value = {"active": False}
+        with (
+            mock.patch.object(lendingbot, "read_status_payload", return_value=published.copy()),
+            mock.patch.object(lendingbot, "v3_store_for_config", return_value=(store, mock.Mock())),
+            mock.patch.object(lendingbot, "controlled_bot_status", return_value={"running": True}),
+            mock.patch.object(lendingbot, "stats_v3_payload", side_effect=AssertionError("history scan in UI poll")),
+        ):
+            payload = lendingbot.dashboard_status_payload("botlog.json", "test.cfg")
+        self.assertEqual(payload["applicationVersion"], lendingbot.APP_VERSION)
+        self.assertEqual(payload["statistics"], published["statistics"])
+        self.assertEqual(payload["realizedIncome"], published["realizedIncome"])
+        self.assertEqual(payload["incomeHistorySync"], published["incomeHistorySync"])
+        self.assertEqual(payload["last_update"], published["last_update"])
+        self.assertEqual(payload["operationMode"], "PAUSED")
+        self.assertIn("manual_pause", payload["last_status"])
+        self.assertTrue(payload["snapshotAvailable"])
+        store.statistics.assert_not_called()
+
+    def test_dashboard_poll_without_worker_history_does_not_fabricate_statistics(self):
+        store = mock.Mock()
+        store.runtime.return_value = {"mode": "LIVE"}
+        store.recovery_status.return_value = {"active": False}
+        with (
+            mock.patch.object(lendingbot, "read_status_payload", return_value=lendingbot.empty_status_payload()),
+            mock.patch.object(lendingbot, "v3_store_for_config", return_value=(store, mock.Mock())),
+            mock.patch.object(lendingbot, "controlled_bot_status", return_value={"running": True}),
+            mock.patch.object(lendingbot, "stats_v3_payload", side_effect=AssertionError("history scan in UI poll")),
+        ):
+            payload = lendingbot.dashboard_status_payload("botlog.json", "test.cfg")
+        self.assertFalse(payload["snapshotAvailable"])
+        self.assertEqual(payload["last_update"], "")
+        self.assertNotIn("statistics", payload)
+        store.statistics.assert_not_called()
 
     def test_dashboard_status_failure_hides_stale_account_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:

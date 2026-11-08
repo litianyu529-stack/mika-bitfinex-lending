@@ -2,12 +2,16 @@
 
 import json
 import os
+import sys
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, ROOT)
+from bitfinex import APP_VERSION  # noqa: E402
+
 WWW = os.path.join(ROOT, "www")
 FIXTURE_NOW_MS = int(time.time() * 1000)
 FIXTURE_LAST_UPDATE = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -600,6 +604,7 @@ class FixtureHandler(SimpleHTTPRequestHandler):
         if path in {"/", "/lendingbot.html"}:
             with open(os.path.join(ROOT, "www", "lendingbot.html"), "rb") as file:
                 data = file.read().replace(b"__MIKA_DASHBOARD_BUILD_ID__", b"fixture-build-v3")
+                data = data.replace(b"__MIKA_APPLICATION_VERSION__", APP_VERSION.encode("ascii"))
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))

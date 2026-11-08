@@ -3,14 +3,15 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="author" content="Bitfinex 自动放贷机器人">
+    <meta name="author" content="Mika Lending Bot">
     <meta name="theme-color" content="#f3f7f7">
+    <meta name="mika-application-version" content="__MIKA_APPLICATION_VERSION__">
     <meta name="mika-dashboard-build" content="__MIKA_DASHBOARD_BUILD_ID__">
     <meta name="mika-dashboard-csrf" content="__MIKA_DASHBOARD_CSRF_TOKEN__">
     <link rel="icon" href="images/bitfinex-lending-icon-32.png" sizes="32x32">
     <link rel="apple-touch-icon" href="images/bitfinex-lending-icon-192.png">
     <link rel="manifest" href="manifest.json">
-    <title>Bitfinex 自动放贷机器人</title>
+    <title>Mika Lending Bot · Bitfinex USD · v__MIKA_APPLICATION_VERSION__</title>
     <link rel="stylesheet" href="lendingbot.css?v=__MIKA_DASHBOARD_BUILD_ID__">
 </head>
 <body>
@@ -18,8 +19,8 @@
         <a class="brand" href="#overview" aria-label="返回总览">
             <img src="images/bitfinex-lending-icon-48.png" width="38" height="38" alt="">
             <span>
-                <strong>Bitfinex 自动放贷机器人</strong>
-                <small>实盘控制台</small>
+                <strong>Mika Lending Bot</strong>
+                <small>Bitfinex USD · v__MIKA_APPLICATION_VERSION__</small>
             </span>
         </a>
         <nav class="tabs" role="tablist" aria-label="控制台页面">
@@ -62,7 +63,7 @@
                     <section class="market-surface" aria-labelledby="capitalTitle">
                         <div class="surface-heading">
                             <div><p class="eyebrow">CAPITAL ALLOCATION</p><h2 id="capitalTitle">资金分布</h2></div>
-                            <span id="statusSchemaBadge" class="schema-badge">实盘状态 v3</span>
+                            <span id="statusSchemaBadge" class="schema-badge">v__MIKA_APPLICATION_VERSION__</span>
                         </div>
                         <div class="market-layout">
                             <div class="chart-block">
@@ -146,8 +147,8 @@
                     <dl class="rail-facts">
                         <div><dt>API 凭据</dt><dd id="credentialState">待检查</dd></div>
                         <div><dt>账户权限</dt><dd id="permissionState">待预检</dd></div>
-                        <div><dt>状态协议</dt><dd id="schemaState">等待同步</dd></div>
-                        <div><dt>V3.5 上线</dt><dd id="releaseBoundary">等待同步</dd></div>
+                        <div><dt>应用版本</dt><dd id="schemaState">v__MIKA_APPLICATION_VERSION__</dd></div>
+                        <div><dt>V3.5 数据分界</dt><dd id="releaseBoundary">等待同步</dd></div>
                         <div><dt>上次同步</dt><dd id="railSync">--</dd></div>
                     </dl>
                     <button id="preflightButton" class="secondary-control" type="button">运行预检</button>

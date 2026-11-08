@@ -1,6 +1,6 @@
 {
-	"name" : "Bitfinex 自动放贷机器人",
-	"short_name" : "自动放贷",
+	"name" : "Mika Lending Bot · Bitfinex USD",
+	"short_name" : "Mika Lending Bot",
 	"icons" : [{
 			"src" : "images/bitfinex-lending-icon-192.png",
 			"sizes" : "192x192",

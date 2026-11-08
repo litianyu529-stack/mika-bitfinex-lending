@@ -2,6 +2,19 @@ from decimal import Decimal
 
 
 D = Decimal
+FRR_OFFSET_OFFER_TYPES = {"FRRDELTAFIX", "FRRDELTAVAR"}
+
+
+def funding_offer_effective_rate(offer, frr_daily_rate=None):
+    """Resolve an open offer's gross daily rate, or None without a usable FRR."""
+    rate_real = offer.get("rate_real")
+    if rate_real is not None:
+        return D(str(rate_real))
+    rate = D(str(offer.get("rate") or 0))
+    if str(offer.get("offer_type") or "LIMIT").upper() not in FRR_OFFSET_OFFER_TYPES:
+        return rate
+    frr = D(str(frr_daily_rate or 0))
+    return frr + rate if frr.is_finite() and frr > 0 else None
 
 
 def _currency(value):
@@ -163,14 +176,18 @@ def parse_funding_trades(rows):
             continue
         try:
             rate = D(str(row[3]))
-            amount = abs(D(str(row[2])))
+            raw_signed_amount = D(str(row[2]))
+            amount = abs(raw_signed_amount)
             period = int(row[4])
             mts = int(row[1])
         except (ValueError, TypeError, ArithmeticError):
             continue
-        if rate <= 0 or amount <= 0 or period < 2 or period > 120:
+        if not rate.is_finite() or not amount.is_finite():
             continue
-        trades.append({"id": str(row[0]), "mts": mts, "amount": amount, "rate": rate, "period": period})
+        if rate <= 0 or amount <= 0 or period < 2 or period > 120 or mts < 0:
+            continue
+        trades.append({"id": str(row[0]), "mts": mts, "amount": amount, "rate": rate, "period": period,
+                       "raw_signed_amount": raw_signed_amount})
     return sorted(trades, key=lambda item: item["mts"])
 
 

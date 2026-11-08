@@ -13,11 +13,11 @@ import traceback
 from decimal import Decimal, getcontext
 from http.server import ThreadingHTTPServer
 
-from bitfinex import Bitfinex, BitfinexApiError
+from bitfinex import APP_VERSION, Bitfinex, BitfinexApiError
 from Logger import Logger
 from AppContext import AppContext
-from ExchangeModels import parse_funding_stats, parse_funding_trades, parse_loan_rows
-from StateStore import LendingStateStore, StateStoreError
+from ExchangeModels import funding_offer_effective_rate, parse_funding_stats, parse_funding_trades, parse_loan_rows
+from StateStore import LendingStateStore, StaleStrategyVersion, StateStoreError
 from RuntimeV3 import (
     LendingRuntimeV3,
     build_active_credit_dashboard,
@@ -36,6 +36,7 @@ from StrategyV3 import (
     json_decimal,
     pool_for_period,
     policy_v3_to_json,
+    policy_v3_with_overrides,
     rate_below_floor,
     replay_strategy_v3,
     validate_policy_v3,
@@ -108,6 +109,10 @@ WORKER_BUILD_FILES = (
     "FileUtils.py",
     "Logger.py",
     "MarketDataStream.py",
+    "MarketHistory.py",
+    "ManualProtection.py",
+    "EventReplay.py",
+    "V36Validation.py",
     "AppContext.py",
     "Configuration.py",
     "DomainTypes.py",
@@ -115,6 +120,7 @@ WORKER_BUILD_FILES = (
     "RuntimeV3.py",
     "StateStore.py",
     "StrategyV3.py",
+    "StrategyState.py",
     "StrategyResearch.py",
     "WriteRecovery.py",
     "Recovery.py",
@@ -271,6 +277,10 @@ def parse_args(argv=None):
     parser.add_argument(
         "--evaluate-strategy", action="store_true", help="run the offline chronological strategy evaluation"
     )
+    parser.add_argument(
+        "--apply-validated-v36", metavar="REPORT_JSON",
+        help="offline: verify the complete V3.6 evidence and activate its exact candidate policy",
+    )
     parser.add_argument("--research-days", type=int, default=90, help="number of days used for backfill/evaluation")
     parser.add_argument("--principal", default="10000", help="offline evaluation principal in USD")
     parser.add_argument("-key", "--apikey", help="Bitfinex API key")
@@ -337,9 +347,10 @@ def load_v3_account_context(client, store, now_ms):
     for offer in offers:
         managed = managed_offers.get(int(offer["id"]))
         offer["managed"] = managed is not None
-        offer["pool"] = (managed or {}).get("pool") or pool_for_period(offer["period"])
         offer["layer"] = (managed or {}).get("layer")
-        offer["display_type"] = (managed or {}).get("display_type") or v3_offer_display_type(offer)
+        offer["pool"] = pool_for_period(offer["period"])
+        offer["display_type"] = v3_offer_display_type(offer)
+        offer["manualProtection"] = store.manual_protection_for_offer(offer, now_ms)
     stored_credits = {int(row["credit_id"]): row for row in store.credits()}
     for credit in [*credits, *loans]:
         stored = stored_credits.get(int(credit["id"]))
@@ -371,7 +382,8 @@ def proposed_external_adoption(account_snapshot, policy):
     }
     if policy.adopt_external_offers:
         for offer in simulated["offers"]:
-            if offer.get("currency") != "USD" or offer.get("managed"):
+            if (offer.get("currency") != "USD" or offer.get("managed")
+                    or (offer.get("manualProtection") or {}).get("protected")):
                 continue
             candidates.append({**offer, "display_type": v3_offer_display_type(offer)})
             offer["managed"] = True
@@ -496,7 +508,7 @@ def strategy_v3_preview(
     proposed_record = {"version_id": proposed_version, "policy": json_decimal(policy.__dict__)}
     incompatible = []
     for offer in planned_snapshot["offers"]:
-        violations = v3_offer_violations(offer, policy)
+        violations = v3_offer_violations(offer, policy, signals.get("frr_daily_rate"))
         if violations:
             incompatible.append({**json_decimal(offer), "violations": violations})
     non_changeable_credits = []
@@ -529,9 +541,7 @@ def strategy_v3_preview(
         "nonChangeableCredits": non_changeable_credits,
         "externalAdoptionCandidates": json_decimal(adoption_candidates),
         "externalAdoptionDigest": _canonical_sha256(adoption_candidates),
-        "ratioRebalanceCancellations": json_decimal(
-            LendingRuntimeV3.ratio_rebalance_candidates(planned_snapshot["offers"], result, policy, now)
-        ),
+        "ratioRebalanceCancellations": [],
         "replay": replay_strategy_v3(policy, trades, stats, account["total"], book, now),
         "warnings": list(dict.fromkeys(warnings)),
         "accountDigest": account_digest,
@@ -607,7 +617,7 @@ def v3_credit_violations(credit, policy):
     return violations
 
 
-def v3_offer_violations(offer, policy):
+def v3_offer_violations(offer, policy, frr_daily_rate=None):
     pool = offer.get("pool") or pool_for_period(int(offer.get("period") or 0))
     display_type = v3_offer_display_type(offer)
     hidden = bool(int(offer.get("flags") or 0) & 64) or bool(offer.get("hidden"))
@@ -621,8 +631,8 @@ def v3_offer_violations(offer, policy):
     floor_apr = policy.floor_apr(pool) if pool in {"short", "medium", "long"} else None
     if floor_apr is not None:
         fee = policy.hidden_fee_rate if hidden else policy.normal_fee_rate
-        effective = Decimal(str(offer.get("rate_real") or offer.get("rate") or 0))
-        if rate_below_floor(effective, gross_daily_floor(floor_apr, fee)):
+        effective = funding_offer_effective_rate(offer, frr_daily_rate)
+        if effective is not None and rate_below_floor(effective, gross_daily_floor(floor_apr, fee)):
             violations.append("below_new_floor")
     return violations
 
@@ -699,7 +709,12 @@ def save_strategy_v3_draft(config_path, payload, app_context=None):
             "strategy": active,
             "diff": [],
         }
-    version_id = store.save_strategy(json_decimal(policy.__dict__), status="DRAFT")
+    try:
+        version_id = store.save_strategy(
+            json_decimal(policy.__dict__), status="DRAFT", expected_active_id=active["version_id"],
+        )
+    except StaleStrategyVersion as exc:
+        raise ApiRequestError("策略已变化，请重新预览", "PREVIEW_STALE", 409) from exc
     if version_id == active["version_id"]:
         return {
             "versionId": version_id,
@@ -709,6 +724,8 @@ def save_strategy_v3_draft(config_path, payload, app_context=None):
             "diff": [],
         }
     draft = store.strategy("DRAFT")
+    if draft is None or draft["version_id"] != version_id:
+        raise ApiRequestError("草稿已变化，请重新预览", "PREVIEW_STALE", 409)
     apply_token = secrets.token_urlsafe(24)
     apply_context = {
         **context,
@@ -750,6 +767,12 @@ def apply_strategy_v3_draft(config_path, payload, client_factory=None, app_conte
     if draft_version != draft["version_id"] or context["draftVersionId"] != draft["version_id"]:
         raise ApiRequestError("待应用草稿与已确认版本不一致", "PREVIEW_STALE", 409)
     draft_policy = strategy_v3_from_record(draft)
+    if draft_policy.quick_pricing_mode == "EXECUTABLE_PREMIUM_V1":
+        from V36Validation import validation_status
+
+        gate = validation_status(store, draft_policy)
+        if not gate["approved"]:
+            raise ApiRequestError("V3.6 候选尚未通过真实数据验收", "V36_VALIDATION_REQUIRED", 409, details=gate)
     refreshed = strategy_v3_preview(
         config_path,
         {"strategyV3": strategy_v3_api_values(draft_policy)},
@@ -764,36 +787,53 @@ def apply_strategy_v3_draft(config_path, payload, client_factory=None, app_conte
             409,
             details={"preview": refreshed},
         )
-    if controlled_bot_running(config_path, app_context) or store.runtime()["mode"] == "LIVE":
-        strategy = store.promote_draft_to_pending()
-        return {"status": "PENDING", "strategy": strategy}
-    store.promote_draft_to_pending()
-    strategy = store.activate_pending_strategy(reason="activated while live process stopped")
-    mirror_active_strategy_v3(config_path, strategy_v3_from_record(strategy))
-    return {"status": "ACTIVE", "strategy": strategy}
+    with app_context.process_state.lock, strategy_token_lock:
+        queue = controlled_bot_running(config_path, app_context) or store.runtime()["mode"] == "LIVE"
+        live_lock = LiveProcessLock(app_context.live_lock_path)
+        if not queue:
+            queue = not live_lock.acquire(config_path, {"role": "strategy_activation"})
+        try:
+            strategy = store.apply_confirmed_draft(
+                draft_version, active["version_id"], queue=queue,
+                validated_policy=draft_policy if draft_policy.quick_pricing_mode == "EXECUTABLE_PREMIUM_V1" else None,
+            )
+            if not queue:
+                mirror_active_strategy_v3(config_path, strategy_v3_from_record(strategy))
+        except StaleStrategyVersion as exc:
+            raise ApiRequestError(
+                "策略版本已变化或已有策略正在应用，请刷新后重新确认",
+                "PREVIEW_STALE", 409, details={"reason": str(exc)},
+            ) from exc
+        finally:
+            live_lock.release()
+    return {"status": "PENDING" if queue else "ACTIVE", "strategy": strategy}
 
 
 def discard_strategy_v3_draft(config_path, app_context=None):
     app_context = process_context(config_path, app_context)
     store, _ = v3_store_for_config(config_path)
     discarded = []
-    with app_context.process_state.lock:
+    with app_context.process_state.lock, strategy_token_lock:
         draft = store.strategy("DRAFT")
         pending = store.strategy("PENDING")
-        running = controlled_bot_running(config_path, app_context)
-        runtime = store.runtime()
-        if pending is not None and draft is None and (running or runtime["mode"] == "LIVE"):
-            raise ApiRequestError(
-                "待应用策略正在由机器人处理；请先停止机器人再撤销",
-                "PENDING_STRATEGY_RUNNING",
-                409,
-            )
-        if draft is not None:
-            store.discard_strategy("DRAFT")
-            discarded.append("DRAFT")
-        if pending is not None and not running and runtime["mode"] != "LIVE":
-            store.discard_strategy("PENDING")
-            discarded.append("PENDING")
+        running = controlled_bot_running(config_path, app_context) or store.runtime()["mode"] == "LIVE"
+        live_lock = LiveProcessLock(app_context.live_lock_path)
+        if pending is not None and not running:
+            running = not live_lock.acquire(config_path, {"role": "strategy_discard"})
+        try:
+            if pending is not None and draft is None and running:
+                raise ApiRequestError(
+                    "待应用策略正在由机器人处理；请先停止机器人再撤销",
+                    "PENDING_STRATEGY_RUNNING", 409,
+                )
+            if draft is not None:
+                store.discard_strategy("DRAFT")
+                discarded.append("DRAFT")
+            if pending is not None and not running:
+                store.discard_strategy("PENDING")
+                discarded.append("PENDING")
+        finally:
+            live_lock.release()
     return {
         "status": "DISCARDED" if discarded else "UNCHANGED",
         "discarded": discarded,
@@ -809,12 +849,15 @@ def replay_v3_from_store(config_path, now_ms=None, context=None):
         raise ConfigError("必须先暂停 LIVE 才能进入 REPLAY")
     store.set_mode("REPLAY", "dashboard_replay")
     now = int(now_ms if now_ms is not None else context.now() * 1000)
-    trades = store.market_trades(now - 7 * 86_400_000, now)
+    trades = store.iter_market_trades(now - 7 * 86_400_000, now)
     with store.read_connection() as connection:
         latest = connection.execute("SELECT total_principal FROM account_samples ORDER BY mts DESC LIMIT 1").fetchone()
     principal = Decimal(latest["total_principal"]) if latest else Decimal("10000")
     _, active_policy = ensure_active_strategy_v3(store, settings)
-    return replay_strategy_v3(active_policy, trades, [], principal, [], now)
+    return replay_strategy_v3(
+        active_policy, trades, store.funding_stats(now - 7 * 86_400_000, now), principal, now_ms=now,
+        book_snapshots=store.iter_book_snapshots(now - 7 * 86_400_000, now),
+    )
 
 
 def empty_status_payload():
@@ -826,6 +869,7 @@ def empty_status_payload():
     )
     return {
         "schemaVersion": STATUS_SCHEMA_VERSION,
+        "applicationVersion": APP_VERSION,
         "operationMode": "PAUSED",
         "last_status": "当前已暂停；进入 LIVE 前必须完成预检并人工确认。",
         "last_update": "",
@@ -900,6 +944,7 @@ def stop_reason_message(reason):
 
 def dashboard_status_payload(status_path, config_path, context=None):
     payload = read_status_payload(status_path)
+    payload["applicationVersion"] = APP_VERSION
     try:
         store, _ = v3_store_for_config(config_path)
         runtime = store.runtime()
@@ -937,7 +982,10 @@ def dashboard_status_payload(status_path, config_path, context=None):
                 if runtime.get("safe_reason")
                 else "策略已暂停；实盘进程仍在运行。"
             )
-        payload.update(stats_v3_payload(store))
+        # The worker publishes statistics with the account snapshot. Rebuilding
+        # every history window here blocks frequent UI polls on large databases
+        # and mixes newer statistics with an older account snapshot. Explicit
+        # history requests can still use /api/stats/v3.
     except Exception as exc:
         unavailable = empty_status_payload()
         unavailable["log"] = list(payload.get("log") or [])
@@ -1279,7 +1327,7 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
     incompatible_managed = []
     incompatible_external = []
     for offer in snapshot["offers"]:
-        violations = v3_offer_violations(offer, policy)
+        violations = v3_offer_violations(offer, policy, signals.get("frr_daily_rate"))
         if not violations:
             continue
         item = {**json_decimal(offer), "display_type": v3_offer_display_type(offer), "violations": violations}
@@ -1308,7 +1356,8 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
             {
                 "code": "EXTERNAL_ADOPTION_REQUIRES_CONFIRMATION",
                 "message": (
-                    f"预检确认后将接管 {len(adoption_candidates)} 笔外部 USD Funding 挂单；集合变化会使确认失效。"
+                    f"启动后将核验并接管 {len(adoption_candidates)} 笔已到保护期限的外部 USD Funding 挂单；"
+                    "仍需两次快照确认。"
                 ),
             }
         )
@@ -1388,9 +1437,7 @@ def evaluate_live_preflight(config_path, client_factory=None, context=None):
         "externalIncompatibilities": incompatible_external,
         "externalAdoptionCandidates": json_decimal(adoption_candidates),
         "externalAdoptionDigest": _canonical_sha256(adoption_candidates),
-        "ratioRebalanceCancellations": json_decimal(
-            LendingRuntimeV3.ratio_rebalance_candidates(snapshot["offers"], result, policy, now)
-        ),
+        "ratioRebalanceCancellations": [],
         "offerPoolAllocation": {
             "basis": result.get("allocation_basis"),
             "target": json_decimal(result.get("target_offer_amounts", {})),
@@ -1514,12 +1561,9 @@ def consume_controlled_bot_preflight(config_path, preflight_id, now=None, contex
     current_ids = [int(row["id"]) for row in summary.get("externalAdoptionCandidates") or []]
     if current_ids != current.get("externalAdoptionIds"):
         raise ConfigError("待接管外部挂单集合在预检后发生变化，请重新运行预检")
-    adopted = (
-        store.adopt_external_offers(summary.get("externalAdoptionCandidates") or [], active["version_id"])
-        if current_ids
-        else []
-    )
-    return {"adoptedOfferIds": adopted}
+    # Starting a worker never substitutes for two authoritative observations.
+    # The worker persists protection and adopts eligible offers after confirmation.
+    return {"adoptedOfferIds": [], "queuedOfferIds": current_ids}
 
 
 def start_controlled_bot(config_path, status_path, preflight_id, context=None, preserve_recovery=False):
@@ -1740,6 +1784,7 @@ def load_dashboard_static_snapshot(directory, build_id, csrf_token=""):
         csrf_token,
         DASHBOARD_BUILD_PLACEHOLDER,
         DASHBOARD_CSRF_PLACEHOLDER,
+        APP_VERSION,
     )
 
 
@@ -1928,10 +1973,47 @@ def migrate_legacy_state(context, store):
     return result
 
 
+def apply_validated_v36(report_path, settings, context):
+    from V36Validation import build_validation_certificate
+
+    live_lock = LiveProcessLock(context.live_lock_path)
+    if not live_lock.acquire(context.config_path, {"role": "offline_v36_activation"}):
+        raise ConfigError("offline activation rejected while the LIVE worker lock is held")
+    try:
+        store = LendingStateStore(context.state_db_path, clock=context.now)
+        with open(report_path, encoding="utf-8") as evidence:
+            report = json.load(evidence)
+        selection = report.get("selection") if isinstance(report, dict) else None
+        parameters = selection.get("candidatePolicy") if isinstance(selection, dict) else None
+        if not isinstance(parameters, dict):
+            raise ValueError("V3.6 activation requires a report with a complete candidate policy")
+        candidate = policy_v3_with_overrides(StrategyPolicyV3(), parameters)
+        validate_policy_v3(candidate, require_live_floors=True)
+        active = store.strategy("ACTIVE")
+        base = strategy_v3_from_record(active) if active else settings.strategy_v3
+        unchanged = set(vars(base)) - {"quick_pricing_mode", "quick_start_premium_apr_points"}
+        if any(getattr(base, name) != getattr(candidate, name) for name in unchanged):
+            raise ValueError("V3.6 activation cannot change allocation, floors, limits or other existing controls")
+        certificate = build_validation_certificate(report, candidate, int(context.now() * 1000))
+        activated = store.install_validated_strategy(
+            json_decimal(vars(candidate)), certificate, None if active is None else active["version_id"],
+        )
+        try:
+            mirror_active_strategy_v3(context.config_path, candidate)
+        except OSError as exc:
+            raise ConfigError(f"策略已启用，但配置镜像写入失败。修复文件权限后可重试本命令。{exc}") from exc
+        return {"strategyVersion": activated["version_id"], "reportDigest": certificate["reportDigest"]}
+    finally:
+        live_lock.release()
+
+
 def run_offline_commands(args, settings, context):
     ensure_offline_database_access(context)
-    store = LendingStateStore(context.state_db_path, clock=context.now)
     results = {}
+    if getattr(args, "apply_validated_v36", None):
+        results["v36Activation"] = apply_validated_v36(args.apply_validated_v36, settings, context)
+    if args.migrate_legacy or args.backfill_market_data or args.evaluate_strategy:
+        store = LendingStateStore(context.state_db_path, clock=context.now)
     if args.migrate_legacy:
         results["legacyMigration"] = migrate_legacy_state(context, store)
     if args.backfill_market_data:
@@ -1944,7 +2026,7 @@ def run_offline_commands(args, settings, context):
             Decimal(str(args.principal)),
             days=args.research_days,
         )
-        report_path = os.path.join(context.project_root, "docs", "strategy-validation-report.json")
+        report_path = os.path.join(context.project_root, ".state", "research", "strategy-validation-report.json")
         os.makedirs(os.path.dirname(report_path), exist_ok=True)
         write_research_report(report_path, report)
         results["strategyEvaluation"] = {
@@ -1958,7 +2040,9 @@ def run_offline_commands(args, settings, context):
 
 def main(argv=None):
     args = parse_args(argv)
-    offline_requested = any((args.migrate_legacy, args.backfill_market_data, args.evaluate_strategy))
+    offline_requested = any((
+        args.migrate_legacy, args.backfill_market_data, args.evaluate_strategy, args.apply_validated_v36,
+    ))
     project_root = os.path.abspath(os.path.dirname(__file__))
     args.config = AppContext.for_project(project_root, config_path=args.config).config_path
     if args.dashboard and args.live:
@@ -2054,10 +2138,14 @@ def main(argv=None):
     if not live_lock.acquire(args.config, {"role": "live_worker", "service": "mika-lending-worker-v3"}):
         log.log("实盘启动被拒绝：另一个机器人进程已持有单实例锁。")
         return 1
+    state_store_v3 = LendingStateStore(settings.state_db_file, clock=context.now)
+    active, active_policy = ensure_active_strategy_v3(state_store_v3, settings)
+    if active["version_id"] != preflight["summary"].get("activeStrategyVersion"):
+        live_lock.release()
+        log.log("实盘启动被拒绝：预检后 ACTIVE 已变化，请重新预检。")
+        return 1
     log.log("实盘预检通过，开始同步账户并执行策略。")
     client = Bitfinex(settings.api_key, settings.api_secret)
-    state_store_v3 = LendingStateStore(settings.state_db_file, clock=context.now)
-    _, active_policy = ensure_active_strategy_v3(state_store_v3, settings)
     # Preserve a durable protected PAUSED across process restarts so bootstrap can reconcile
     # the uncertain exchange write from authoritative account data. Normal
     # PAUSED starts still transition directly to LIVE after the confirmed preflight.

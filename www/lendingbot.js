@@ -156,7 +156,9 @@ function statusIsStale(status = state.status || {}) {
 }
 
 function normalizedOffer(offer) {
-    const rate = offer.dailyRatePercent ?? (offer.rate == null ? null : safeNumber(offer.rate) * 100);
+    const rate = "dailyRatePercent" in offer
+        ? offer.dailyRatePercent
+        : (offer.rate == null ? null : safeNumber(offer.rate) * 100);
     return {
         ...offer,
         dailyRatePercent: rate,
@@ -330,6 +332,17 @@ function ageLabel(elapsedMinutes) {
 
 function repriceLabel(offer) {
     const age = ageLabel(offer.elapsedMinutes);
+    const protection = offer.manualProtection;
+    if (protection?.protected) {
+        const until = new Date(protection.protectedUntilMs).toLocaleString("zh-CN");
+        const minutes = Math.max(0, Math.ceil((protection.protectedUntilMs - Date.now()) / 60000));
+        const source = protection.timeSource === "FIRST_OBSERVED" ? " · 操作时间异常，按首次发现计时" : "";
+        return `${age} · 手动保护中 · 剩余 ${minutes} 分钟 · 预计 ${until} 后接管${source} · 安全规则可提前处理`;
+    }
+    if (protection?.needsTakeover) return `${age} · 手动保护已到期，等待安全核验后接管`;
+    if (protection?.reason && protection.reason !== "external_takeover") {
+        return `${age} · 安全规则提前处理：${protection.reason}`;
+    }
     const state = offer.repriceState;
     if (!state) return age;
     const floorState = state.floorState;
@@ -683,10 +696,12 @@ function renderStatus() {
     $("headerSync").textContent = status.last_update || "--";
     $("railSync").textContent = status.last_update || "--";
 
+    const version = document.querySelector('meta[name="mika-application-version"]')?.content;
+    const versionLabel = version ? `v${version}` : "版本未知";
     const badge = $("statusSchemaBadge");
-    badge.textContent = !valid ? "等待实盘状态" : (stale ? "状态已过期" : `V3.5 · ${mode}`);
+    badge.textContent = `${versionLabel} · ${!valid ? "等待实盘状态" : stale ? "状态已过期" : mode}`;
     badge.classList.toggle("invalid", !valid || stale || Boolean(safeReason) || recovery.active || writeBlocked);
-    $("schemaState").textContent = !valid ? "未同步" : (stale ? "V3.5 · 已过期" : `V3.5 · ${mode}`);
+    $("schemaState").textContent = versionLabel;
     const releaseComparison = status.releaseComparison || {};
     $("releaseBoundary").textContent = releaseComparison.activatedAtMs
         ? formatDateTime(releaseComparison.activatedAtMs)
@@ -891,7 +906,7 @@ function renderPreflight(data) {
         ["账户快照", summary.accountSnapshot?.stale ? "历史快照（阻止启动）" : "实时账户"],
     ];
     const grouped = (summary.strategyPlan || []).map((row) => `${row.display_type} ${row.period}天 ${formatAmount(row.amount)} USD`);
-    items.push(["实际 V3.5 计划", grouped.join(" · ") || "当前无新挂单计划"]);
+    items.push(["实际挂单计划", grouped.join(" · ") || "当前无新挂单计划"]);
     const adoptionRows = (summary.externalAdoptionCandidates || []).map(
         (row) => `#${row.id} · ${formatAmount(row.amount)} USD · ${row.period}天 · ${row.display_type || row.offer_type || "--"}`
     );

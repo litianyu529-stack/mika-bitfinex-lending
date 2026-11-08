@@ -17,10 +17,14 @@ DUST_REINVEST_MINIMUM = D("1")
 RATE_TICK = D("0.0000001")
 RATE_COMPARISON_EPSILON = D("0.000000000000000001")
 EXACT_TERM_EXPLORATION_CURVE = "EXACT_TERM_EXPLORATION_V4"
+QUICK_EXECUTION_CURVE = "QUICK_EXECUTION_PREMIUM_V1"
+LEGACY_QUICK_MODE = "EXPLORATION_V4"
+EXECUTABLE_QUICK_MODE = "EXECUTABLE_PREMIUM_V1"
 EXACT_TERM_EXPLORATION_CURVES = {
     "EXACT_TERM_EXPLORATION_V2",
     "EXACT_TERM_EXPLORATION_V3",
     EXACT_TERM_EXPLORATION_CURVE,
+    QUICK_EXECUTION_CURVE,
 }
 LEGACY_REPRICE_CURVE = "LEGACY"
 POOLS = ("short", "medium", "long")
@@ -198,6 +202,8 @@ class StrategyPolicyV3:
     max_reprices_per_hour: int = 12
     minimum_rate_change: D = D("0.00001")
     balanced_start_premium_percent: D = D("5")
+    quick_pricing_mode: str = LEGACY_QUICK_MODE
+    quick_start_premium_apr_points: D = D("0.10")
     high_start_premium_percent: D = D("12")
     balanced_landing_stage: int = 5
     high_landing_stage: int = 7
@@ -227,7 +233,7 @@ class StrategyPolicyV3:
         return {layer: getattr(self, f"{layer}_share") for layer in LAYERS}
 
     def reprice_stages(self, pool, layer=None, pricing_curve_version=None):
-        if layer == "quick" and pricing_curve_version == EXACT_TERM_EXPLORATION_CURVE:
+        if layer == "quick" and pricing_curve_version in {EXACT_TERM_EXPLORATION_CURVE, QUICK_EXECUTION_CURVE}:
             return getattr(self, f"quick_{pool}_reprice_stages_minutes")
         return getattr(self, f"{pool}_reprice_stages_minutes")
 
@@ -264,6 +270,8 @@ V3_FIELD_CONVERTERS = {
     "max_reprices_per_hour": int,
     "minimum_rate_change": _d,
     "balanced_start_premium_percent": _d,
+    "quick_pricing_mode": str,
+    "quick_start_premium_apr_points": _d,
     "high_start_premium_percent": _d,
     "balanced_landing_stage": int,
     "high_landing_stage": int,
@@ -302,6 +310,10 @@ def validate_policy_v3(policy, require_live_floors=False):
         raise ValueError("strategy version must be 3")
     if policy.currency.upper() != "USD":
         raise ValueError("strategy v3 currently supports USD only")
+    if policy.quick_pricing_mode not in {LEGACY_QUICK_MODE, EXECUTABLE_QUICK_MODE}:
+        raise ValueError("quick_pricing_mode must be EXPLORATION_V4 or EXECUTABLE_PREMIUM_V1")
+    if not policy.quick_start_premium_apr_points.is_finite() or not 0 <= policy.quick_start_premium_apr_points <= 1:
+        raise ValueError("quick_start_premium_apr_points must be 0-1 net APR percentage points")
     if sum(policy.pool_shares().values(), D("0")) != D("100"):
         raise ValueError("short, medium, and long shares must total 100")
     if sum(policy.layer_shares().values(), D("0")) != D("100"):
@@ -420,7 +432,8 @@ def pool_for_period(period):
     return "external"
 
 
-def weighted_quantile(rows, quantile, value_key="rate", weight_key="amount"):
+def _weighted_quantiles(rows, quantiles, value_key="rate", weight_key="amount"):
+    """Resolve several volume-weighted quantiles with one sort and one scan."""
     valid = []
     for row in rows or []:
         try:
@@ -431,16 +444,25 @@ def weighted_quantile(rows, quantile, value_key="rate", weight_key="amount"):
         if value > 0 and weight > 0:
             valid.append((value, weight))
     if not valid:
-        return D("0")
+        return tuple(D("0") for _ in quantiles)
     valid.sort(key=lambda item: item[0])
     total = sum((item[1] for item in valid), D("0"))
-    target = total * D(quantile)
+    targets = sorted((total * D(quantile), index) for index, quantile in enumerate(quantiles))
+    result = [valid[-1][0]] * len(targets)
     seen = D("0")
+    pending = 0
     for value, weight in valid:
         seen += weight
-        if seen >= target:
-            return value
-    return valid[-1][0]
+        while pending < len(targets) and seen >= targets[pending][0]:
+            result[targets[pending][1]] = value
+            pending += 1
+        if pending == len(targets):
+            break
+    return tuple(result)
+
+
+def weighted_quantile(rows, quantile, value_key="rate", weight_key="amount"):
+    return _weighted_quantiles(rows, (quantile,), value_key, weight_key)[0]
 
 
 def filter_supported_trades(trades, policy):
@@ -465,8 +487,7 @@ def filter_supported_trades(trades, policy):
     high_volume = sum((row["amount"] for row in rows if row["rate"] > q95), D("0"))
     if high_volume < support:
         rows = [row for row in rows if row["rate"] <= q95 or row["amount"] >= support]
-    low = weighted_quantile(rows, D("0.05"))
-    high = weighted_quantile(rows, D("0.95"))
+    low, high = _weighted_quantiles(rows, (D("0.05"), D("0.95")))
     return [dict(row, rate=max(low, min(high, row["rate"]))) for row in rows]
 
 
@@ -483,6 +504,22 @@ def _weighted_std(rows, center):
         return D("0")
     variance = sum((row["amount"] * (row["rate"] - center) ** 2 for row in rows), D("0")) / total
     return D(str(math.sqrt(float(max(D("0"), variance)))))
+
+
+def _window_statistics(rows, now_ms):
+    windows = {}
+    for window in WINDOWS_MS:
+        selected = _window_rows(rows, now_ms, window)
+        q25, median, q75 = _weighted_quantiles(selected, (D("0.25"), D("0.5"), D("0.75")))
+        windows[window] = {
+            "median": median,
+            "q25": q25,
+            "q75": q75,
+            "volume": sum((row["amount"] for row in selected), D("0")),
+            "count": len(selected),
+            "volatility": _weighted_std(selected, median),
+        }
+    return windows
 
 
 def _period_book_rows(book, period, borrower_side=None):
@@ -505,7 +542,7 @@ def _period_book_rows(book, period, borrower_side=None):
     return rows
 
 
-def _build_period_selection(policy, signals, filtered_trades, book, now_ms):
+def _build_period_selection(policy, signals, filtered_trades, book, now_ms, window_snapshot=None):
     """Score every configured term against one global, actionable demand denominator."""
 
     configured = []
@@ -521,32 +558,22 @@ def _build_period_selection(policy, signals, filtered_trades, book, now_ms):
     for period in configured:
         pool = period_pool[period]
         period_trades = [row for row in filtered_trades if int(row["period"]) == period]
+        cached = (window_snapshot or {}).get("byPeriod", {})
+        cached_period = cached.get(period, cached.get(str(period), {}))
         floor_apr = policy.floor_apr(pool)
         floor_rate = (
             D("0")
             if floor_apr is None or floor_apr <= 0
             else ceil_rate_tick(gross_daily_floor(floor_apr, policy.normal_fee_rate))
         )
-        rate_windows = {}
-        for window in WINDOWS_MS:
-            selected = _window_rows(period_trades, now_ms, window)
-            median = weighted_quantile(selected, D("0.5"))
-            rate_windows[window] = {
-                "median": median,
-                "q25": weighted_quantile(selected, D("0.25")),
-                "q75": weighted_quantile(selected, D("0.75")),
-                "volume": sum((row["amount"] for row in selected), D("0")),
-                "count": len(selected),
-                "volatility": _weighted_std(selected, median),
-            }
+        rate_windows = cached_period.get("windows") or _window_statistics(period_trades, now_ms)
         window_metrics = {}
         for window in PERIOD_DEMAND_WINDOW_WEIGHTS:
-            selected = _window_rows(period_trades, now_ms, window)
             window_metrics[window] = {
-                "tradeCount": len(selected),
-                "tradeVolume": sum((row["amount"] for row in selected), D("0")),
+                "tradeCount": rate_windows[window]["count"],
+                "tradeVolume": rate_windows[window]["volume"],
             }
-            demand_data_present = demand_data_present or bool(selected)
+            demand_data_present = demand_data_present or bool(rate_windows[window]["count"])
         bids = _period_book_rows(book, period, borrower_side=True)
         offers = _period_book_rows(book, period, borrower_side=False)
         book_data_present = book_data_present or bool(bids or offers)
@@ -585,9 +612,11 @@ def _build_period_selection(policy, signals, filtered_trades, book, now_ms):
             "anchorRate": anchor_rate,
             "trend": period_trend,
             "trendThreshold": trend_threshold,
-            "rateDataAvailable": bool(bids or offers or period_trades),
+            "rateDataAvailable": bool(bids or offers or period_trades or rate_windows["7d"]["count"]),
             "executableBorrowDepth": executable_depth,
-            "supportedCeiling": max([best_bid, *recent_rates], default=D("0")),
+            "supportedCeiling": max([best_bid, D(cached_period.get("maxRate7d") or 0), *recent_rates]),
+            "borrowLevels": sorted(bids, key=lambda item: item["rate"], reverse=True),
+            "dataQuality": cached_period.get("quality", {}),
             "targetRate": target_rate,
             "grossDailyFloor": floor_rate,
             "absoluteDemandShare": D("0"),
@@ -724,23 +753,30 @@ def _build_period_selection(policy, signals, filtered_trades, book, now_ms):
     return result
 
 
-def build_market_signals_v3(book, trades, stats, policy, now_ms=None):
+def build_market_signals_v3(book, trades, stats, policy, now_ms=None, window_snapshot=None):
     validate_policy_v3(policy)
     now = int(now_ms if now_ms is not None else time.time() * 1000)
-    filtered = filter_supported_trades(trades, policy)
-    windows = {}
-    for window in WINDOWS_MS:
-        selected = _window_rows(filtered, now, window)
-        median = weighted_quantile(selected, D("0.5"))
-        volume = sum((row["amount"] for row in selected), D("0"))
-        windows[window] = {
-            "median": median,
-            "q25": weighted_quantile(selected, D("0.25")),
-            "q75": weighted_quantile(selected, D("0.75")),
-            "volume": volume,
-            "count": len(selected),
-            "volatility": _weighted_std(selected, median),
-        }
+    snapshot_as_of = int((window_snapshot or {}).get("asOfMs") or 0)
+    snapshot_compatible = bool(
+        window_snapshot
+        and window_snapshot.get("schemaVersion") == 1
+        and window_snapshot.get("policyFingerprint") == hashlib.sha256(json.dumps(
+            json_decimal(vars(policy)), sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+        and 0 <= now - snapshot_as_of <= 60_000
+    )
+    use_snapshot = bool(
+        snapshot_compatible and window_snapshot.get("usable")
+        and window_snapshot.get("cleaningVersion") == "exact-term-supported-v1"
+        and window_snapshot.get("coverage", {}).get("complete")
+    )
+    use_legacy_cache = bool(
+        snapshot_compatible and window_snapshot.get("snapshotKind") == "LEGACY_GLOBAL_20K"
+        and window_snapshot.get("cleaningVersion") == "legacy-global-v1"
+    )
+    use_cached_stats = use_snapshot or use_legacy_cache
+    filtered = [] if use_cached_stats else filter_supported_trades(trades, policy)
+    windows = window_snapshot["global"]["windows"] if use_cached_stats else _window_statistics(filtered, now)
     demand_rows = _window_rows(filtered, now, "7d")
     total_demand_count = len(demand_rows)
     total_demand_volume = sum((row["amount"] for row in demand_rows), D("0"))
@@ -760,6 +796,8 @@ def build_market_signals_v3(book, trades, stats, policy, now_ms=None):
             "volume_share": volume_share,
             "score": count_share * D("0.60") + volume_share * D("0.40"),
         }
+    if use_cached_stats:
+        period_demand = window_snapshot["global"].get("periodDemand", {})
     asks = [row for row in book or [] if D(row.get("amount", 0)) > 0]
     bids = [row for row in book or [] if D(row.get("amount", 0)) < 0]
     best_offer = min((D(row["rate"]) for row in asks), default=D("0"))
@@ -824,10 +862,18 @@ def build_market_signals_v3(book, trades, stats, policy, now_ms=None):
         "depth": depth,
         "period_demand": period_demand,
         "period_demand_basis": "RECENT_TRADES_COUNT_60_VOLUME_40",
-        "filtered_trade_count": len(filtered),
-        "raw_trade_count": len(trades or []),
+        "filtered_trade_count": window_snapshot.get("validTradeCount", 0) if use_cached_stats else len(filtered),
+        "raw_trade_count": window_snapshot.get("rawTradeCount", 0) if use_cached_stats else len(trades or []),
+        "historyMode": "COMPLETE_WINDOW" if use_snapshot else "LEGACY_INPUT",
+        "historyQuality": {
+            key: value for key, value in (window_snapshot or {}).items()
+            if key not in {"global", "byPeriod", "windows", "periodWindows"}
+        },
+        "completeWindowUsable": use_snapshot,
     }
-    period_selection = _build_period_selection(policy, result, filtered, book, now)
+    period_selection = _build_period_selection(
+        policy, result, filtered, book, now, window_snapshot if use_cached_stats else None
+    )
     result["period_selection"] = period_selection
     result["periodSelection"] = period_selection
     return result
@@ -1115,6 +1161,25 @@ def allocate_slices_v3(
     }
     pool_counts = _capped_weighted_counts(target_count, POOLS, pool_additions, pool_maximum_counts)
     pool_plan_amounts = {pool: D(pool_counts[pool]) * USD_ORDER_CHUNK for pool in POOLS}
+    fragmented_pool = None
+    if not any(pool_counts.values()):
+        # Cash can exceed the minimum while every pool deficit is below it.
+        # Permit one order within the existing 150 USD allocation tolerance.
+        receivers = [
+            pool for pool in active_pools
+            if pool_additions[pool] > 0
+            and pool_allocation[pool]["additionalQualified"]
+            and not pool_allocation[pool]["lowDemandConfirmed"]
+        ]
+        if receivers:
+            fragmented_pool = max(
+                receivers,
+                key=lambda pool: (pool_additions[pool], pool_allocation[pool]["compositeScore"]),
+            )
+            pool_counts[fragmented_pool] = 1
+            pool_plan_amounts[fragmented_pool] = min(
+                target_deployable, pool_additions[fragmented_pool] + USD_ORDER_CHUNK
+            ).quantize(SATOSHI, rounding=ROUND_DOWN)
     unassigned = target_deployable - sum(pool_plan_amounts.values(), D("0"))
     while unassigned > SATOSHI:
         rooms = {
@@ -1202,6 +1267,7 @@ def allocate_slices_v3(
             "layer": layer_sequence[index] if index < len(layer_sequence) else "balanced",
             "amount": order_amounts[index],
             "period": period,
+            "fragmented_pool_fallback": pool == fragmented_pool,
             "minimum_floor_order": bool(
                 pool_allocation[pool]["minimumApplied"] and offer_exposure[pool] < USD_ORDER_CHUNK
             ),
@@ -1381,8 +1447,71 @@ def exploration_start_rate_for_period(
     return ceil_rate_tick(max(floor_rate, target))
 
 
+def executable_quick_quote(item, signals, floor_rate, policy, fee_rate=None):
+    """Price a new quick slice; a net APR point is 0.01 of annual principal."""
+    if (
+        policy is None or policy.quick_pricing_mode != EXECUTABLE_QUICK_MODE
+        or item.get("layer") != "quick" or not signals.get("completeWindowUsable")
+        or not signals.get("quickPricingEnabled", True)
+    ):
+        return None
+    pool, period = str(item["pool"]), int(item["period"])
+    floor_rate = ceil_rate_tick(floor_rate)
+    selection = signals.get("periodSelection") or signals.get("period_selection") or {}
+    row = next(
+        (entry for entry in selection.get("byPool", {}).get(pool, {}).get("scores", [])
+         if int(entry.get("period") or 0) == period), {}
+    )
+    amount = max(USD_ORDER_CHUNK, D(item.get("amount") or USD_ORDER_CHUNK))
+    depth = D("0")
+    reference = D("0")
+    sufficient = False
+    for level in sorted(row.get("borrowLevels", []), key=lambda entry: D(entry["rate"]), reverse=True):
+        rate, size = D(level["rate"]), abs(D(level["amount"]))
+        if size <= 0 or rate < floor_rate:
+            continue
+        depth += size
+        reference = rate
+        if depth >= amount:
+            sufficient = True
+            break
+    source = "BORROW_DEPTH" if sufficient else "PARTIAL_BORROW_DEPTH"
+    if depth < USD_ORDER_CHUNK:
+        reference = D("0")
+        for window in ("1h", "24h"):
+            metrics = row.get("rateWindows", {}).get(window, {})
+            effective = D(row.get("dataQuality", {}).get("effectiveSampleSize") or 0)
+            if int(metrics.get("count") or 0) >= 30 and effective >= 10 and D(metrics.get("median") or 0) > 0:
+                reference = D(metrics["median"])
+                source = f"EXACT_TERM_MEDIAN_{window.upper()}"
+                break
+    if reference <= 0:
+        return None
+    fee = policy.normal_fee_rate if fee_rate is None else D(fee_rate)
+    reference_apr = net_apr_from_daily(reference, fee)
+    premium = D(policy.quick_start_premium_apr_points) / D("100")
+    target = ceil_rate_tick(max(
+        floor_rate, gross_daily_floor(reference_apr + premium, fee)
+    ))
+    landing = ceil_rate_tick(max(floor_rate, reference))
+    return {
+        "targetRate": target,
+        "fixedLandingRate": min(target, landing),
+        "referenceRate": reference,
+        "referenceNetApr": reference_apr,
+        "referenceSource": source,
+        "availableBorrowDepth": depth,
+        "depthSufficient": sufficient,
+        "premiumAprPoints": policy.quick_start_premium_apr_points,
+        "pricingCurveVersion": QUICK_EXECUTION_CURVE,
+    }
+
+
 def _candidate_target_rate(item, signals, floor_rate, policy=None):
     floor_rate = ceil_rate_tick(floor_rate)
+    executable = executable_quick_quote(item, signals, floor_rate, policy)
+    if executable is not None:
+        return executable["targetRate"]
     if item.get("pool") is not None and item.get("period") is not None:
         target = (
             competitive_rate_for_period(item["layer"], item["pool"], item["period"], signals, floor_rate)
@@ -1586,25 +1715,39 @@ def build_strategy_plan_v3(
                     continue
                 fee = policy.hidden_fee_rate if is_hidden else policy.normal_fee_rate
                 floor_rate = gross_daily_floor(floor_apr, fee)
-                if rate_below_floor(effective_rate, floor_rate):
+                quick_quote = executable_quick_quote(item, signals, floor_rate, policy, fee_rate=fee)
+                candidate_target = quick_quote["targetRate"] if quick_quote else target
+                candidate_submitted, candidate_effective = submitted_rate, effective_rate
+                if quick_quote:
+                    candidate_submitted, candidate_effective = next(
+                        (submitted, effective) for kind, submitted, effective, display
+                        in _candidate_types(policy, frr, candidate_target)
+                        if kind == offer_type and display == display_type
+                    )
+                if rate_below_floor(candidate_effective, floor_rate):
                     continue
                 candidate = {
                     **item,
                     "offer_type": offer_type,
                     "display_type": display_type,
-                    "submitted_rate": submitted_rate,
-                    "effective_rate": effective_rate,
-                    "target_rate": target,
-                    "fixed_landing_rate": competitive_rate_for_period(
-                        item["layer"],
-                        item["pool"],
-                        item["period"],
-                        signals,
-                        floor_rate,
+                    "submitted_rate": candidate_submitted,
+                    "effective_rate": candidate_effective,
+                    "target_rate": candidate_target,
+                    "fixed_landing_rate": (
+                        quick_quote["fixedLandingRate"] if quick_quote else competitive_rate_for_period(
+                            item["layer"], item["pool"], item["period"], signals, floor_rate,
+                        )
                     ),
                     "hidden": is_hidden,
                     "flags": 64 if is_hidden else 0,
                     "gross_daily_floor": floor_rate,
+                    "pricing_curve_version": QUICK_EXECUTION_CURVE if quick_quote else EXACT_TERM_EXPLORATION_CURVE,
+                    "quickQuote": quick_quote,
+                    "quickFallbackReason": (
+                        "LEGACY_INPUT_OR_INSUFFICIENT_SAME_TERM_REFERENCE"
+                        if item["layer"] == "quick" and policy.quick_pricing_mode == EXECUTABLE_QUICK_MODE
+                        and quick_quote is None else None
+                    ),
                 }
                 score, components, net_apr = _score_candidate(candidate, item, signals, policy, floor_apr)
                 candidate.update({"score": score, "score_components": components, "net_apr": net_apr})
@@ -1646,6 +1789,11 @@ def build_strategy_plan_v3(
 
         def safe_capacity(row):
             capacity = absorbable_remainder
+            if row.get("fragmented_pool_fallback"):
+                capacity = min(capacity, max(
+                    D("0"), D(target_by_pool[row["pool"]]) + USD_ORDER_CHUNK
+                    - D(current_by_pool[row["pool"]]) - planned_by_pool[row["pool"]]
+                ))
             if row["offer_type"] == "FRRDELTAVAR":
                 capacity = min(capacity, max(D("0"), variable_limit - variable_used))
             if row["hidden"]:
@@ -1745,203 +1893,23 @@ def json_decimal(value):
     return value
 
 
-def replay_strategy_v3(policy, trades, stats, principal, book=None, now_ms=None, window_ms=None):
-    validate_policy_v3(policy)
+def replay_strategy_v3(policy, trades, stats, principal, book=None, now_ms=None, window_ms=None,
+                       *, book_snapshots=None, assumptions=None, **kwargs):
+    """Compatibility entry point for the continuous offline event engine.
+
+    A current book is not historical evidence. Callers must supply timestamped
+    book_snapshots; missing observations pause simulated new orders and reprices.
+    """
+    from EventReplay import run_event_replay
+
     now = int(now_ms if now_ms is not None else time.time() * 1000)
     window = int(window_ms if window_ms is not None else WINDOWS_MS["7d"])
     if window <= 0:
         raise ValueError("replay window must be positive")
-    principal = D(principal)
-    selected = sorted(
-        [row for row in trades or [] if now - window <= int(row.get("mts", 0)) < now],
-        key=lambda row: int(row["mts"]),
-    )
-    if not selected:
-        return {
-            "mode": "REPLAY",
-            "sampleCount": 0,
-            "estimatedUtilizationPercent": "0",
-            "netInterest": "0",
-            "actualNetAprPercent": "0",
-            "orders": [],
-            "fills": [],
-            "returns": [],
-            "idlePrincipalTime": "0",
-        }
-    step_ms = 15 * 60_000
-    start = max(now - window, int(selected[0]["mts"]))
-    cursor = start - (start % step_ms)
-    available = principal
-    active = []
-    fills = []
-    returns = []
-    interest = D("0")
-    utilized_time = D("0")
-    idle_time = D("0")
-    last_signals = None
-    trade_index = 0
-    signal_history = []
-    stat_rows = sorted(
-        [row for row in stats or [] if int(row.get("mts", row.get("timestamp", 0)) or 0) <= now],
-        key=lambda row: int(row.get("mts", row.get("timestamp", 0)) or 0),
-    )
-    stat_index = 0
-    latest_stat = None
-
-    def replay_book(history):
-        if book and cursor + step_ms >= now:
-            return book
-        recent = [row for row in history if int(row["mts"]) >= cursor - WINDOWS_MS["1h"]]
-        rows = []
-        for period in sorted({int(row.get("period", 2)) for row in recent}):
-            period_rows = [row for row in recent if int(row.get("period", 2)) == period]
-            median = weighted_quantile(period_rows, D("0.5"))
-            q25 = weighted_quantile(period_rows, D("0.25"))
-            if median <= 0:
-                continue
-            volume = max(
-                USD_ORDER_CHUNK,
-                sum((abs(D(row["amount"])) for row in period_rows), D("0")),
-            )
-            rows.extend(
-                (
-                    {"rate": median, "period": period, "count": len(period_rows), "amount": volume},
-                    {"rate": q25 or median, "period": period, "count": len(period_rows), "amount": -volume},
-                )
-            )
-        return rows
-
-    def aggregate_signal_trades(rows, mts):
-        aggregated = []
-        periods = sorted({int(row.get("period", 2)) for row in rows})
-        for period in periods:
-            weighted_rate = D("0")
-            total_volume = D("0")
-            for row in rows:
-                if int(row.get("period", 2)) != period:
-                    continue
-                try:
-                    volume = abs(D(row["amount"]))
-                    rate = D(row["rate"])
-                except (KeyError, TypeError, ValueError, ArithmeticError):
-                    continue
-                if volume <= 0 or rate <= 0:
-                    continue
-                weighted_rate += rate * volume
-                total_volume += volume
-            if total_volume > 0:
-                aggregated.append(
-                    {
-                        "mts": int(mts),
-                        "rate": weighted_rate / total_volume,
-                        "amount": total_volume,
-                        "period": period,
-                    }
-                )
-        return aggregated
-
-    while cursor < now:
-        interval_end = min(now, cursor + step_ms)
-        still_active = []
-        for credit in active:
-            if credit["return_mts"] <= cursor:
-                elapsed_days = D(credit["return_mts"] - credit["fill_mts"]) / D("86400000")
-                fee = policy.hidden_fee_rate if credit["hidden"] else policy.normal_fee_rate
-                earned = credit["amount"] * credit["effective_rate"] * elapsed_days * (D("1") - fee)
-                interest += earned
-                available += credit["amount"]
-                returns.append({**credit, "interest": earned})
-            else:
-                still_active.append(credit)
-        active = still_active
-
-        active_amount = sum((credit["amount"] for credit in active), D("0"))
-        duration_days = D(interval_end - cursor) / D("86400000")
-        utilized_time += active_amount * duration_days
-        idle_time += max(D("0"), principal - active_amount) * duration_days
-
-        interval_start = trade_index
-        while trade_index < len(selected) and int(selected[trade_index]["mts"]) < interval_end:
-            trade_index += 1
-        interval_trades = selected[interval_start:trade_index]
-        signal_history = [row for row in signal_history if int(row["mts"]) >= cursor - WINDOWS_MS["7d"]]
-        while stat_index < len(stat_rows):
-            stat_mts = int(stat_rows[stat_index].get("mts", stat_rows[stat_index].get("timestamp", 0)) or 0)
-            if stat_mts > cursor:
-                break
-            latest_stat = stat_rows[stat_index]
-            stat_index += 1
-        if available >= USD_ORDER_CHUNK and signal_history and interval_trades:
-            synthetic_book = replay_book(signal_history)
-            replay_stats = [] if latest_stat is None else [latest_stat]
-            last_signals = build_market_signals_v3(
-                synthetic_book,
-                signal_history,
-                replay_stats,
-                policy,
-                cursor,
-            )
-            exposure = {pool: D("0") for pool in POOLS}
-            for credit in active:
-                exposure[credit["pool"]] += credit["amount"]
-            plan = build_strategy_plan_v3(principal, available, exposure, policy, last_signals, f"replay:{cursor}")
-            remaining_volume = {}
-            for trade in interval_trades:
-                key = (int(trade.get("period", 2)), D(trade["rate"]))
-                remaining_volume[key] = remaining_volume.get(key, D("0")) + abs(D(trade["amount"]))
-            for order in plan["plan"]:
-                eligible = [
-                    key
-                    for key, volume in remaining_volume.items()
-                    if volume > 0 and key[0] == int(order["period"]) and key[1] >= order["effective_rate"]
-                ]
-                if not eligible or available < USD_ORDER_CHUNK:
-                    continue
-                eligible.sort(key=lambda key: key[1])
-                volume = sum((remaining_volume[key] for key in eligible), D("0"))
-                fill_amount = min(order["amount"], available, volume)
-                if fill_amount < USD_ORDER_CHUNK:
-                    continue
-                unconsumed = fill_amount
-                for key in eligible:
-                    consumed = min(unconsumed, remaining_volume[key])
-                    remaining_volume[key] -= consumed
-                    unconsumed -= consumed
-                    if unconsumed <= 0:
-                        break
-                credit = {
-                    **order,
-                    "amount": fill_amount,
-                    "fill_mts": cursor,
-                    "return_mts": cursor + int(order["period"]) * 86_400_000,
-                }
-                active.append(credit)
-                fills.append(credit)
-                available -= fill_amount
-        signal_history.extend(aggregate_signal_trades(interval_trades, interval_end - 1))
-        cursor = interval_end
-
-    for credit in active:
-        elapsed_days = D(max(0, now - credit["fill_mts"])) / D("86400000")
-        fee = policy.hidden_fee_rate if credit["hidden"] else policy.normal_fee_rate
-        interest += credit["amount"] * credit["effective_rate"] * elapsed_days * (D("1") - fee)
-    elapsed_days = D(max(1, now - start)) / D("86400000")
-    principal_time = principal * elapsed_days
-    utilization = D("0") if principal_time <= 0 else utilized_time / principal_time
-    apr = D("0") if principal_time <= 0 else interest / principal_time * D("365")
-    return json_decimal(
-        {
-            "mode": "REPLAY",
-            "sampleCount": len(selected),
-            "replayAggregationMinutes": step_ms // 60_000,
-            "estimatedUtilizationPercent": utilization * D("100"),
-            "netInterest": interest,
-            "actualNetAprPercent": apr * D("100"),
-            "orders": fills,
-            "fills": fills,
-            "returns": returns,
-            "activeCredits": active,
-            "idlePrincipalTime": idle_time,
-            "signals": last_signals or build_market_signals_v3(book or [], selected, stats or [], policy, now),
-        }
+    rows = (row for row in (trades or ()) if now - window <= int(row.get("mts", 0)) < now)
+    if isinstance(trades, (list, tuple)):
+        rows = sorted(rows, key=lambda row: int(row["mts"]))
+    return run_event_replay(
+        policy, rows, stats, principal, book_snapshots=book_snapshots,
+        now_ms=now, start_ms=now - window, assumptions=assumptions, **kwargs,
     )

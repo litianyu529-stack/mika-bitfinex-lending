@@ -1,4 +1,5 @@
 import hashlib
+import heapq
 import hmac
 import json
 import threading
@@ -12,6 +13,7 @@ from ExchangeModels import (
     parse_loan_rows,
     parse_offer_rows,
     parse_wallet_rows,
+    parse_funding_trades,
 )
 
 
@@ -47,11 +49,13 @@ class BitfinexMarketDataHub:
         fallback_seconds=300,
         rest_stale_seconds=60,
         max_trades=20_000,
+        history_service=None,
     ):
         self.api_key = api_key or ""
         self.api_secret = api_secret or ""
         self.symbol = symbol
         self.store = store
+        self.history_service = history_service
         self.fallback_ms = int(fallback_seconds) * 1000
         self.rest_stale_ms = int(rest_stale_seconds) * 1000
         self.max_trades = int(max_trades)
@@ -67,7 +71,8 @@ class BitfinexMarketDataHub:
         self._credits_snapshot_ready = False
         self._loans_snapshot_ready = False
         self._book = {}
-        self._trades = deque(maxlen=self.max_trades)
+        self._trades = {}
+        self._public_trade_heap = []
         self._wallets = {}
         self._offers = {}
         self._credits = {}
@@ -245,29 +250,44 @@ class BitfinexMarketDataHub:
     def _apply_public_trade(self, entry):
         if not isinstance(entry, (list, tuple)) or len(entry) < 5:
             return
-        trade = {
-            "id": str(entry[0]),
-            "mts": int(entry[1]),
-            "amount": abs(_as_decimal(entry[2])),
-            "rate": _as_decimal(entry[3]),
-            "period": int(entry[4]),
-        }
+        parsed = parse_funding_trades([entry])
+        if not parsed:
+            return
+        trade = parsed[0]
         self._merge_trades([trade])
-        if self.store is not None:
+        if self.history_service is not None:
+            self.history_service.ingest([trade], observed_at_ms=_now_ms(), source="WEBSOCKET")
+        elif self.store is not None:
             self.store.upsert_market_trades([trade])
 
     def _merge_trades(self, trades):
         """Merge public funding trades by id and retain the newest bounded set."""
-        merged = {str(row["id"]): dict(row) for row in self._trades if row.get("id") is not None}
         for row in trades or []:
             normalized = dict(row)
             normalized["id"] = str(normalized["id"])
             normalized["amount"] = abs(D(normalized["amount"]))
             normalized["rate"] = D(normalized["rate"])
             normalized["mts"] = int(normalized["mts"])
-            merged[normalized["id"]] = normalized
-        newest = sorted(merged.values(), key=lambda row: (int(row["mts"]), str(row["id"])))
-        self._trades = deque(newest[-self.max_trades :], maxlen=self.max_trades)
+            previous = self._trades.get(normalized["id"])
+            self._trades[normalized["id"]] = normalized
+            if previous is None or int(previous["mts"]) != normalized["mts"]:
+                heapq.heappush(self._public_trade_heap, (normalized["mts"], normalized["id"]))
+        # Sorting belongs to snapshots. Heap eviction bounds memory even when
+        # callers stop taking snapshots, without sorting inside event callbacks.
+        if len(self._trades) > max(self.max_trades * 2, self.max_trades + 1000):
+            while len(self._trades) > self.max_trades and self._public_trade_heap:
+                mts, trade_id = heapq.heappop(self._public_trade_heap)
+                row = self._trades.get(trade_id)
+                if row is not None and int(row["mts"]) == mts:
+                    self._trades.pop(trade_id)
+
+    def _trim_public_trades(self):
+        newest = sorted(self._trades.values(), key=lambda row: (int(row["mts"]), str(row["id"])))
+        newest = newest[-self.max_trades:]
+        self._trades = {str(row["id"]): row for row in newest}
+        self._public_trade_heap = [(int(row["mts"]), str(row["id"])) for row in newest]
+        heapq.heapify(self._public_trade_heap)
+        return newest
 
     def _merge_funding_trades(self, trades):
         """Merge authenticated funding trades by id without double-counting updates."""
@@ -414,7 +434,9 @@ class BitfinexMarketDataHub:
                     for row in loans
                 }
             self._rest_last_sync_ms = now
-        if self.store is not None and trades:
+        if self.history_service is not None:
+            self.history_service.ingest(trades or [], observed_at_ms=now, source="REST")
+        elif self.store is not None and trades:
             self.store.upsert_market_trades(trades)
 
     def snapshot(self, now_ms=None):
@@ -477,7 +499,7 @@ class BitfinexMarketDataHub:
                 "safeRequired": bool(disconnected_for >= self.fallback_ms or (not ws_healthy and not rest_fresh)),
                 "lastError": self._last_error,
                 "book": [dict(row) for row in self._book.values()],
-                "trades": [dict(row) for row in self._trades],
+                "trades": [dict(row) for row in self._trim_public_trades()],
                 "wallets": [dict(row) for row in self._wallets.values()],
                 "offers": [dict(row) for row in self._offers.values()],
                 "credits": [dict(row) for row in self._credits.values()],

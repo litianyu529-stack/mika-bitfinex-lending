@@ -144,6 +144,7 @@ V3_LIST_FIELDS = {
     "quick_long_reprice_stages_minutes",
 }
 V3_PERIOD_FIELDS = {"short_periods", "medium_periods", "long_periods"}
+V3_STRING_FIELDS = {"quick_pricing_mode"}
 V3_FIXED_FIELDS = {"max_pool_shift", "adopt_external_offers"}
 V3_CONFIG_FIELDS = tuple(
     name
@@ -176,6 +177,8 @@ def strategy_v3_from_config(config):
                 values[field_name] = Decimal(str(raw)) / Decimal("100")
             elif field_name in V3_BOOL_FIELDS:
                 values[field_name] = str(raw).strip().lower() in {"1", "true", "yes", "on"}
+            elif field_name in V3_STRING_FIELDS:
+                values[field_name] = str(raw).strip()
             elif field_name in V3_INT_FIELDS:
                 values[field_name] = int(raw)
             elif field_name in V3_PERIOD_FIELDS:
@@ -263,6 +266,8 @@ def strategy_v3_from_api_payload(payload, base=None):
             )
         elif field_name in V3_INT_FIELDS:
             values[field_name] = int(value)
+        elif field_name in V3_STRING_FIELDS:
+            values[field_name] = str(value).strip()
         elif field_name in V3_PERIOD_FIELDS:
             values[field_name] = value
         elif field_name in V3_LIST_FIELDS:
@@ -324,6 +329,27 @@ def backup_strategy_state(config_path, state_db_file):
     return {"config": config_backup, "database": database_backup}
 
 
+def _legacy_quick_defaults_are_compatible(record, canonical):
+    """Accept only an intact V3.5 policy extended by the two inert defaults.
+
+    Keeping its original content hash avoids creating a second strategy and
+    rebinding existing chains merely because the application gained fields.
+    """
+    raw = record.get("policy")
+    defaults = {"quick_pricing_mode": "EXPLORATION_V4", "quick_start_premium_apr_points": "0.10"}
+    if not isinstance(raw, dict) or set(canonical) - set(raw) != set(defaults):
+        return False
+    if any(canonical.get(key) != value for key, value in defaults.items()):
+        return False
+    if set(raw) != set(canonical) - set(defaults):
+        return False
+    original = json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    expected = json.dumps({key: value for key, value in canonical.items() if key not in defaults},
+                          ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return (original == expected
+            and record.get("version_id") == hashlib.sha256(original.encode("utf-8")).hexdigest()[:16])
+
+
 def normalize_current_active_strategy(config_path):
     config, _ = read_config(config_path)
     settings = build_settings(_settings_args(), config)
@@ -352,16 +378,18 @@ def normalize_current_active_strategy(config_path):
             json_decimal(pre_policy.__dict__), ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         pre_version = hashlib.sha256(pre_serialized.encode("utf-8")).hexdigest()[:16]
-        if pre_migration_active["version_id"] != pre_version:
+        if pre_migration_active["version_id"] != pre_version and not _legacy_quick_defaults_are_compatible(
+            pre_migration_active, json_decimal(pre_policy.__dict__),
+        ):
             backup = backup_strategy_state(config_path, settings.state_db_file)
     store = LendingStateStore(settings.state_db_file)
     active, policy = ensure_active_strategy_v3(store, settings)
     canonical = json_decimal(policy.__dict__)
     serialized = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     canonical_version = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
-    if active["version_id"] == canonical_version:
-        store.repair_normalized_reprice_chains(canonical_version)
-        return {"changed": False, "versionId": canonical_version, "backup": None}
+    if active["version_id"] == canonical_version or _legacy_quick_defaults_are_compatible(active, canonical):
+        store.repair_normalized_reprice_chains(active["version_id"])
+        return {"changed": False, "versionId": active["version_id"], "backup": None}
     if backup is None:
         backup = backup_strategy_state(config_path, settings.state_db_file)
     version_id = store.normalize_active_strategy(

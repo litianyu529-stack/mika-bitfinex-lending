@@ -47,7 +47,7 @@ class DashboardApplication:
     start_controlled: Callable[..., dict]
 
 
-def load_static_snapshot(directory, build_id, csrf_token, build_placeholder, csrf_placeholder):
+def load_static_snapshot(directory, build_id, csrf_token, build_placeholder, csrf_placeholder, app_version):
     assets = {}
     root = os.path.abspath(directory)
     for current, _, files in os.walk(root):
@@ -64,6 +64,7 @@ def load_static_snapshot(directory, build_id, csrf_token, build_placeholder, csr
             if relative == "lendingbot.html":
                 data = data.replace(build_placeholder.encode("utf-8"), build_id.encode("ascii"))
                 data = data.replace(csrf_placeholder.encode("utf-8"), csrf_token.encode("ascii"))
+                data = data.replace(b"__MIKA_APPLICATION_VERSION__", app_version.encode("ascii"))
             assets[relative] = data
     return assets
 

@@ -302,7 +302,7 @@ def test_small_balance_respects_minimum_and_pool_caps(available, expected_count,
         assert result["empty_reason"] in {"BELOW_MINIMUM", "CONCENTRATION_CAP_OR_MINIMUM"}
 
 
-def test_small_live_balance_stays_idle_when_no_safe_pool_slice_fits():
+def test_fragmented_pool_deficits_use_one_order_within_allocation_tolerance():
     available = D("240.12179174")
     result = build_strategy_plan_v3(
         D("13169.46811969"),
@@ -319,8 +319,33 @@ def test_small_live_balance_stays_idle_when_no_safe_pool_slice_fits():
         },
     )
 
-    assert result["plan"] == []
-    assert result["idle_amount"] == available
+    assert len(result["plan"]) == 1
+    row = result["plan"][0]
+    assert row["amount"] >= D("150")
+    assert result["planned_amount"] + result["idle_amount"] == available
+    pool = row["pool"]
+    assert result["current_offer_amounts"][pool] + row["amount"] <= result["target_offer_amounts"][pool] + D("150")
+
+
+@pytest.mark.parametrize("cap", [None, D("13600")])
+def test_166_wallet_fragmentation_regression(monkeypatch, cap):
+    monkeypatch.setattr("StrategyV3._pool_targets_v33", lambda *_args: (
+        {"short": D("287.72823020"), "medium": D("180.74051923"), "long": D("150")},
+        ("short", "medium", "long"),
+    ))
+    result = build_strategy_plan_v3(
+        D("13778.90784513"), D("166.00781590"), {},
+        limit_policy(max_lend_amount=cap), signals(), "fragmented-166",
+        existing_exposure={"total": D("13612.90002923")},
+        offer_exposure_by_pool={"short": D("150"), "medium": D("152.46093353"), "long": D("150")},
+    )
+    if cap is None:
+        assert len(result["plan"]) == 1
+        assert result["plan"][0]["pool"] == "short"
+        assert result["planned_amount"] == D("166.00781590")
+        assert result["idle_amount"] == 0
+    else:
+        assert result["plan"] == []
 
 
 def test_small_balance_uses_largest_eligible_deficit_instead_of_pool_order():
@@ -789,39 +814,6 @@ def test_new_balanced_offer_q75_guard_never_weakens_floor():
     )
 
     assert target == D("0.0002088")
-
-
-def test_ratio_overweight_converges_without_canceling_existing_offers():
-    now = 2_000_000_000_000
-    configured = limit_policy(short_share=D("60"), medium_share=D("30"), long_share=D("10"))
-    plan = {
-        "ratio_tolerance": D("150"),
-        "deviation_amounts": {"short": D("400"), "medium": D("-300"), "long": D("-100")},
-    }
-    offers = [
-        {
-            "offer_id": 1,
-            "currency": "USD",
-            "managed": 1,
-            "pool": "short",
-            "period": 2,
-            "amount": D("200"),
-            "rate": D("0.0003"),
-            "mts_created": now - 700_000,
-        },
-        {
-            "offer_id": 2,
-            "currency": "USD",
-            "managed": 1,
-            "pool": "short",
-            "period": 3,
-            "amount": D("200"),
-            "rate": D("0.0002"),
-            "mts_created": now - 700_000,
-        },
-    ]
-    candidates = LendingRuntimeV3.ratio_rebalance_candidates(offers, plan, configured, now)
-    assert candidates == []
 
 
 def test_net_apr_floors_and_fee_difference_are_enforced():
@@ -1845,7 +1837,7 @@ def test_period_selection_blocks_empty_market_and_uses_shorter_tie_break():
     assert tied["long"]["selectedPeriod"] == 120
 
 
-def test_replay_advances_fills_returns_interest_and_idle_time_without_exchange():
+def test_replay_without_historical_book_preserves_cash_and_discloses_missing_evidence():
     now = 1_900_000_000_000
     replay_policy = limit_policy(short_share=D("100"), medium_share=D("0"), long_share=D("0"))
     trades = [
@@ -1860,9 +1852,10 @@ def test_replay_advances_fills_returns_interest_and_idle_time_without_exchange()
     ]
     result = replay_strategy_v3(replay_policy, trades, [], D("900"), [], now)
     assert result["mode"] == "REPLAY"
-    assert len(result["fills"]) > 0
-    assert len(result["returns"]) > 0
-    assert D(result["netInterest"]) > 0
+    assert result["fills"] == []
+    assert result["returns"] == []
+    assert D(result["finalState"]["cash"]) == D("900")
+    assert result["marketMode"] == "NO_OBSERVED_BOOK"
     assert D(result["idlePrincipalTime"]) >= 0
 
 
@@ -2893,6 +2886,92 @@ def test_visible_limit_reprice_absorbs_sub_150_surplus_and_preserves_chain(tmp_p
     assert D(rebound["fixed_landing_rate"]) == D("0.00031")
 
 
+@pytest.mark.parametrize(("offer_type", "display_type", "offset"), [
+    ("FRRDELTAFIX", "FRR_DELTA_FIXED", "0"),
+    ("FRRDELTAFIX", "FRR_DELTA_FIXED", "0.0000002"),
+    ("FRRDELTAVAR", "FRR", "0"),
+    ("FRRDELTAVAR", "FRR_DELTA_VARIABLE", "0.0000002"),
+])
+def test_frr_offer_floor_uses_effective_rate_in_live_and_preflight(tmp_path, offer_type, display_type, offset):
+    now = 1_900_000_000_000
+    configured = policy(enable_frr=True, enable_frr_delta_fixed=True, enable_frr_delta_variable=True,
+                        short_floor_apr=D("0.06"), normal_fee_rate=D("0.147"))
+    offer = {"id": 9001, "currency": "USD", "amount": D("150"), "rate": D(offset), "rate_real": None,
+             "offer_type": offer_type, "display_type": display_type, "period": 2, "managed": True}
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    store.reconcile_offers([offer], now)
+    runtime = LendingRuntimeV3(object(), configured, store, hub=object())
+    account = {"existingExposure": {"total": D("150")}}
+    result = {"funding_cap": D("1000")}
+    for frr, expected in [(D("0.00029930"), []), (None, []), (D("0.00010"), ["below_new_floor"])]:
+        assert lendingbot.v3_offer_violations(offer, configured, frr) == expected
+        adjustments = runtime._pending_adjustments({"frr_daily_rate": frr}, account, configured, result, now)
+        assert [reason for _, _, reason in adjustments] == expected
+    assert lendingbot.v3_offer_violations(dict(offer, rate_real=D("0.00015")), configured, D("0.00030")) == [
+        "below_new_floor"
+    ]
+
+
+@pytest.mark.parametrize("offset", [D("0"), D("0.0001")])
+def test_fixed_delta_reprices_on_schedule_only_when_offset_can_decrease(tmp_path, offset):
+    started = 1_900_000_000_000
+    frr = D("0.00029930")
+    configured = policy(enable_frr_delta_fixed=True, minimum_offer_minutes=1)
+    stages = configured.reprice_stages("short", "quick", EXACT_TERM_EXPLORATION_CURVE)
+    due = started + stages[0] * 60_000
+    store = LendingStateStore(tmp_path / "state.sqlite3", clock=lambda: due / 1000)
+    order = dict(intent_order(), submitted_rate=offset, effective_rate=frr + offset,
+                 offer_type="FRRDELTAFIX", display_type="FRR_DELTA_FIXED",
+                 fixed_landing_rate=D("0.00023"), pricing_curve_version=EXACT_TERM_EXPLORATION_CURVE)
+    _, intent = store.reserve_intent(order, D("1000"))
+    store.confirm_intent(intent["id"], 9100)
+    store.reconcile_offers([dict(order, id=9100, rate=offset, rate_real=None, mts_created=started)], started)
+
+    class Client:
+        api_key = api_secret = ""
+
+        def __init__(self):
+            self.canceled = []
+            self.submitted = []
+
+        def cancel_funding_offer(self, offer_id):
+            self.canceled.append(offer_id)
+            return [0, "SUCCESS"]
+
+        def submit_funding_offer(self, symbol, amount, rate, period, offer_type, flags=0):
+            self.submitted.append((D(rate), period, offer_type))
+            return [0, "on-req", None, None, [9101]]
+
+    client = Client()
+    runtime = LendingRuntimeV3(client, configured, store, hub=object(), clock=lambda: due / 1000)
+    market = {"market": signals(frr_daily_rate=frr)}
+    plan = {"plan": [{"pool": "short", "layer": "quick", "display_type": "LIMIT", "period": 2, "flags": 0}]}
+    assert runtime._cancel_reprice_candidates(market, plan, due - 1, "v3") == []
+    chain = store.reprice_chain_for_offer(9100)
+    assert D(chain["origin_rate"]) == frr + offset
+    assert chain["current_stage"] == 0
+
+    if offset == 0:
+        for minutes in stages:
+            assert runtime._cancel_reprice_candidates(market, plan, started + minutes * 60_000, "v3") == []
+        assert client.canceled == []
+        assert store.reprice_chain_for_offer(9100)["current_stage"] == len(stages)
+        return
+
+    assert runtime._cancel_reprice_candidates(market, plan, due, "v3") == [9100]
+    store.reconcile_offers([], due + 1)
+    assert runtime._submit_pending_reprices(D("150"), "v3") == ([], D("0"))
+    new_frr = D("0.00030500")
+    submitted, available = runtime._submit_pending_reprices(D("150"), "v3", frr_daily_rate=new_frr)
+    new_offset, period, offer_type = client.submitted[0]
+    assert 0 <= new_offset < offset
+    assert (period, offer_type, available) == (2, "FRRDELTAFIX", 0)
+    assert submitted[0]["effective_rate"] == new_frr + new_offset
+    assert submitted[0]["effective_rate"] >= submitted[0]["gross_daily_floor"]
+    replacement_chain = store.reprice_chain_for_offer(9101)
+    assert (replacement_chain["current_stage"], replacement_chain["started_at_ms"]) == (1, started)
+
+
 def test_shape_replacement_never_raises_and_preserves_chain_timing_and_landing(tmp_path):
     now = 1_900_000_000_000
     store = LendingStateStore(tmp_path / "shape.sqlite3")
@@ -3651,14 +3730,20 @@ def test_preflight_adoption_creates_managed_intent_and_is_idempotent():
             "mts_created": 1_900_000_000_000,
             "mts_updated": 1_900_000_000_000,
         }
-        first = store.adopt_external_offers([offer], "active-v3")
-        second = store.adopt_external_offers([offer], "active-v3")
+        now = offer["mts_created"] + 7_200_000
+        store.reconcile_offers([offer], now)
+        store.observe_external_takeover(offer, now - 30_000)
+        store.observe_external_takeover(offer, now)
+        first = store.adopt_external_offers([offer], "active-v3", now_ms=now)
+        second = store.adopt_external_offers([offer], "active-v3", now_ms=now)
         assert first == [9901]
         assert second == []
         assert store.offers(active_only=True)[0]["managed"] == 1
         with store.read_connection() as connection:
             intent = connection.execute("SELECT * FROM order_intents WHERE exchange_offer_id=9901").fetchone()
-            events = connection.execute("SELECT COUNT(*) FROM ownership_events WHERE offer_id=9901").fetchone()[0]
+            events = connection.execute(
+                "SELECT COUNT(*) FROM ownership_events WHERE offer_id=9901 AND event_type='ADOPT_EXTERNAL'"
+            ).fetchone()[0]
         assert intent["resolution"] == "PREFLIGHT_ADOPTED"
         assert intent["pool"] == "medium"
         assert events == 1
@@ -4424,8 +4509,11 @@ def test_v35_release_boundary_is_immutable_and_splits_equal_windows(tmp_path):
     first = LendingStateStore(path, clock=lambda: activated / 1000)
 
     assert first.release_boundary() == {
-        "version": "0.3.5.2",
-        "label": "V3.5",
+        "version": "0.3.6.0",
+        "label": "V3.6",
+        "baselineVersion": "0.3.5.2",
+        "baselineLabel": "V3.5",
+        "v36ActivatedAtMs": None,
         "activatedAtMs": activated,
         "boundarySource": "FIRST_V35_START",
         "evidenceAtMs": None,
@@ -4464,10 +4552,19 @@ def test_v35_release_boundary_moves_back_to_exact_term_live_session(tmp_path):
             ("historical-v2-fingerprint", "historical-v2-slice", first_exact_order_at, first_exact_order_at),
         )
 
+    # Reconstruct the pre-upgrade fixture: only the schema-16 migration may
+    # repair missing historical evidence; normal schema-18 reads are immutable.
+    with store.transaction(immediate=True) as connection:
+        connection.execute("UPDATE schema_meta SET value='16' WHERE key='schema_version'")
+        connection.execute("DELETE FROM schema_meta WHERE key IN ('schema_family','v36_initialization_complete')")
+
     restarted = LendingStateStore(path, clock=lambda: (published_at + 60_000) / 1000)
     assert restarted.release_boundary() == {
-        "version": "0.3.5.2",
-        "label": "V3.5",
+        "version": "0.3.6.0",
+        "label": "V3.6",
+        "baselineVersion": "0.3.5.2",
+        "baselineLabel": "V3.5",
+        "v36ActivatedAtMs": None,
         "activatedAtMs": live_at,
         "boundarySource": "LIVE_SESSION_BEFORE_EXACT_TERM_EXPLORATION",
         "evidenceAtMs": first_exact_order_at,
@@ -4493,12 +4590,12 @@ def test_external_takeover_requires_two_matching_snapshots_and_cancels_exact_id(
         "flags": 0,
         "status": "ACTIVE",
         "pool": "long",
-        "mts_created": now - 60_000,
+        "mts_created": now - 7_200_000,
     }
     store.reconcile_offers([offer], now)
     assert store.observe_external_takeover(offer, now)["state"] == "OBSERVED"
     assert store.observe_external_takeover(offer, now + 30_000)["state"] == "CONFIRMED"
-    assert store.adopt_external_offers([offer], "v3.3") == [5074345865]
+    assert store.adopt_external_offers([offer], "v3.3", now_ms=now + 30_000) == [5074345865]
 
     class Client:
         api_key = ""

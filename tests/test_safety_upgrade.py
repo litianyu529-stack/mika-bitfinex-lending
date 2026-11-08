@@ -12,7 +12,6 @@ from urllib import error
 
 import pytest
 
-import StrategyV3
 import lendingbot
 from AppContext import AppContext
 from DomainTypes import AccountSnapshot, MarketSnapshot, StrategyPlan, WriteOutcome, WriteResult
@@ -206,7 +205,7 @@ def test_schema_v16_is_explicit(tmp_path):
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(order_intents)")}
         chain_columns = {row["name"] for row in connection.execute("PRAGMA table_info(reprice_chains)")}
-    assert version == "16"
+    assert version == "19"
     assert {
         "write_phase",
         "resolution",
@@ -336,7 +335,7 @@ def test_schema_v16_migrates_offer_history_without_losing_rows(tmp_path):
     with store.read_connection() as connection:
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         row = connection.execute("SELECT * FROM offer_history WHERE offer_id=9001").fetchone()
-    assert version == "16"
+    assert version == "19"
     assert row["amount"] == "150"
     assert row["amount_original"] is None
 
@@ -961,20 +960,17 @@ class PublicPages:
         self.trade_calls = 0
         self.stats_calls = 0
 
-    def funding_trades(self, _symbol, **_kwargs):
+    def funding_trades(self, _symbol, **kwargs):
         self.trade_calls += 1
-        if self.trade_calls == 1:
-            return [[1, self.start + 100, "1", "0.0002", 2], [2, self.start + 200, "1", "0.0003", 3]]
-        return [[3, self.end - 100, "1", "0.0004", 5]]
+        rows = [[1, self.start + 100, "1", "0.0002", 2], [2, self.start + 200, "1", "0.0003", 3],
+                [3, self.end - 100, "1", "0.0004", 5]]
+        return [row for row in rows if kwargs["start"] <= row[1] <= kwargs["end"]][:kwargs["limit"]]
 
-    def funding_stats(self, _symbol, **_kwargs):
+    def funding_stats(self, _symbol, **kwargs):
         self.stats_calls += 1
-        if self.stats_calls == 1:
-            return [
-                [self.end - 100, 0, 0, "0.0002", 2, 0, 0, "100", "50"],
-                [self.start + 100, 0, 0, "0.0002", 2, 0, 0, "100", "50"],
-            ]
-        return []
+        rows = [[self.end - 100, 0, 0, "0.0002", 2, 0, 0, "100", "50"],
+                [self.start + 100, 0, 0, "0.0002", 2, 0, 0, "100", "50"]]
+        return [row for row in rows if kwargs["start"] <= row[0] <= kwargs["end"]][:kwargs["limit"]]
 
 
 def test_live_market_context_requests_latest_trades_before_applying_limit():
@@ -1041,7 +1037,7 @@ def test_market_retention_prunes_all_market_time_series(tmp_path):
 
     deleted = store.prune_market_data(retention_days=90, now_ms=now)
 
-    assert deleted == {"trades": 1, "bars": 1, "books": 1, "stats": 1}
+    assert deleted == {"trades": 1, "bars": 2, "books": 1, "stats": 1}
     assert [row["id"] for row in store.market_trades()] == ["recent"]
     assert [row["mts"] for row in store.funding_stats()] == [recent]
     assert [row["mts"] for row in store.book_snapshots()] == [recent - (recent % 60_000)]
@@ -1115,9 +1111,11 @@ def test_strategy_evaluation_uses_fixed_chronological_splits(tmp_path):
     synthetic_market(store, now)
     report = evaluate_strategies(store, policy(), D("1000"), now_ms=now)
     assert [report["split"][name]["days"] for name in ("train", "validation", "test")] == [60, 15, 15]
-    assert report["baselines"] == ["current_v3", "frr_only", "limit_near_fill"]
+    assert report["baselines"] == ["A", "B"]
+    assert report["comparison"]["strategyLabels"] == ["A", "B", "C"]
     assert report["selection"]["requiresManualPromotion"] is True
-    assert report["selection"]["rolloutStagesPercent"] == [10, 25, 50, 100]
+    assert report["selection"]["eligibleForLiveCandidate"] is False
+    assert report["selection"]["scenarioCount"] == 12
 
 
 def test_research_variants_preserve_hard_user_boundaries():
@@ -1173,16 +1171,20 @@ def test_replay_signals_do_not_read_future_funding_stats(monkeypatch):
         {"mts": start, "frr_daily_rate": D("0.0004"), "utilization": D("0.5")},
         {"mts": start + 90 * 60_000, "frr_daily_rate": D("0.0099"), "utilization": D("0.9")},
     ]
-    original = StrategyV3.build_market_signals_v3
+    import EventReplay
+
+    original = EventReplay.build_market_signals_v3
     observed = []
 
-    def checked_signals(book, history, visible_stats, active_policy, now_ms=None):
+    def checked_signals(book, history, visible_stats, active_policy, now_ms=None, **kwargs):
         observed.append((now_ms, [row["mts"] for row in visible_stats]))
         assert all(int(row["mts"]) <= int(now_ms) for row in visible_stats)
-        return original(book, history, visible_stats, active_policy, now_ms)
+        return original(book, history, visible_stats, active_policy, now_ms, **kwargs)
 
-    monkeypatch.setattr(StrategyV3, "build_market_signals_v3", checked_signals)
-    replay_strategy_v3(policy(), trades, stats, D("1000"), now_ms=now, window_ms=DAY_MS)
+    monkeypatch.setattr(EventReplay, "build_market_signals_v3", checked_signals)
+    books = [{"mts": row["mts"], "observed_at_ms": row["mts"], "book": []} for row in trades]
+    replay_strategy_v3(policy(), trades, stats, D("1000"), now_ms=now, window_ms=DAY_MS,
+                       book_snapshots=books, assumptions={"require_full_window": False})
     assert observed
 
 
