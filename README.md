@@ -1,29 +1,32 @@
-# Bitfinex-lendingbot 0.3.5.2 / V3.5
+# Mika Lending Bot · Bitfinex USD 自动放贷
 
-[![Windows verification](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml/badge.svg)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/actions/workflows/windows-verify.yml)
-[![Release](https://img.shields.io/github/v/release/litianyu529-stack/Bitfinex-lendingbot)](https://github.com/litianyu529-stack/Bitfinex-lendingbot/releases)
+[![Windows verification](https://github.com/litianyu529-stack/mika-bitfinex-lending/actions/workflows/windows-verify.yml/badge.svg?branch=main)](https://github.com/litianyu529-stack/mika-bitfinex-lending/actions/workflows/windows-verify.yml)
+[![正式版](https://img.shields.io/github/v/release/litianyu529-stack/mika-bitfinex-lending?label=stable)](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/)
 
-面向单台 Windows 电脑、单一 Bitfinex 账户的 USD Funding 自动放贷工具。项目只保留 V3 策略；Dashboard 默认 `PAUSED`，只有完成真实账户只读预检并人工确认后才会启动 LIVE Worker。
+在 Windows 上自动管理 Bitfinex USD Funding。用本地控制台查看余额和挂单，为短、中、长期限设置最低净年化和资金上限。遇到断线或交易结果不明时，机器人先暂停写入，再核对订单状态。
+
+*Automated Bitfinex USD funding for Windows with a local dashboard, configurable lending limits, and order reconciliation.*
+
+**[下载正式版](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/latest)** · [Windows 快速开始](#快速开始) · [反馈问题](https://github.com/litianyu529-stack/mika-bitfinex-lending/issues)
+
+![Mika Lending Bot 总览，显示模拟余额、资金分布和挂单状态](docs/dashboard-preview.png)
+
+*控制台总览 · 演示数据*
+
+- **控制资金与利率**：为三个期限池设置最低净年化，并限制可参与放贷的金额。
+- **先对账再恢复**：提交或撤单结果不明时，核对交易所记录后才继续写入。
+- **本地管理**：控制台仅监听本机，默认暂停，实盘需要预检和人工确认。
 
 > [!WARNING]
-> 本项目会在 Bitfinex 账户中执行真实资金操作，不承诺收益。首次使用请保持 Dashboard 为 `PAUSED`，核对 API 权限、资金上限和最低净 APR，并从小额资金开始。
-
-## 功能概览
-
-- 本地 Dashboard 管理策略、运行状态与人工确认，不向公网开放控制端口。
-- V3 短/中/长期限分层策略，提供资金上限、比例约束和最低净 APR 硬边界。
-- 对超时、断线和不确定交易结果执行停写、对账与安全恢复，避免盲目重复下单。
-- 使用 SQLite 保存归属、审计和恢复状态，并提供历史数据回填与离线策略评估。
-- Windows GitHub Actions 持续验证 Python、前端语法、安全流程和测试覆盖率。
+> 实盘模式会在 Bitfinex 执行真实资金操作。首次使用请先在暂停模式核对 API 权限、资金上限和最低净年化。
 
 ## 安全边界
 
 - 仅支持 `USD`，期限限定为 Bitfinex Funding 的 2–120 天。
 - API 必须允许 wallets 读取、funding 读取/写入；withdraw 与 ui_withdraw 写权限必须关闭。
 - 机器人只撤改 SQLite 中能够证明归属的挂单。V3.5 对外部 fUSD 挂单执行两次至少间隔 30 秒且账户守恒的权威快照确认，确认后自动托管并只按具体 Offer ID 撤销；外部 Credits 不接管、不关闭。
-- 短/中/长比例约束当前托管未成交挂单金额，已成交 Credits 只计入资金上限；超过 `max(150 USD, 2%)` 容差时分阶段再平衡。
+- 短/中/长比例约束当前托管未成交挂单金额，已成交 Credits 只计入资金上限；已有有效挂单随新增资金逐步收敛，比例偏离本身不会触发撤单。
 - 提交、撤单和钱包转账统一区分 `CONFIRMED / DEFINITE_REJECT / UNKNOWN`。请求发出后的超时、断线、截断响应、非法 JSON 或提交成功但缺少 Offer ID 都属于 `UNKNOWN`；先停止写入并对账，不会盲目重复请求。
 - 除人工暂停/停止外，网络、认证、配置、市场数据、账户数据、程序异常和 Worker 重启故障都会统一进入 PAUSED 的只读恢复循环，并在两次完整 REST 同步（至少间隔 30 秒）后自动恢复此前模式。不确定撤单会用 Offers 快照确认存在或消失后恢复；不确定提交会用请求时间附近的 Offers、Funding Trades 和历史 Offers 唯一绑定，或在两次权威快照确认不存在后关闭。多个候选会持续自动对账，但在无法唯一确认前绝不重新写入。
 - WebSocket 每代连接必须重新收到 Book、Wallet、Offers、Credits 快照；新 Book snapshot 会清空上一代盘口。快照未齐全时只能使用新鲜 REST 完整降级数据。
@@ -114,7 +117,7 @@ python -m pip install -r requirements-dev.txt
 - Dashboard：按内容生成 build hash
 - 核心入口：`lendingbot.py --dashboard`、`lendingbot.py --live`
 - 状态库：`.state/lendingbot-v3.sqlite3`
-- 发布记录：[GitHub Releases](https://github.com/litianyu529-stack/Bitfinex-lendingbot/releases)
+- 发布记录：[GitHub Releases](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases)
 - 运行架构：[docs/architecture.md](docs/architecture.md)
 - 异常处置：[docs/safety-recovery.md](docs/safety-recovery.md)
 - 策略证据标准：[docs/strategy-validation.md](docs/strategy-validation.md)
