@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Mika Lending Bot V4</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">MIKA LENDING BOT</p>
+      <h1>V4 联动网格控制台</h1>
+      <p class="muted">fUSD · Visible LIMIT · 60 秒账户同步 · 5 分钟完整重算</p>
+    </div>
+    <div class="mode-box">
+      <span id="mode" class="badge">LOADING</span>
+      <span id="action" class="muted">正在连接本地 Worker…</span>
+    </div>
+  </header>
+
+  <main>
+    <section id="safePanel" class="alert hidden">
+      <strong>SAFE 已阻止所有写入</strong>
+      <span id="safeReason"></span>
+      <span id="recoveryProgress"></span>
+      <span id="recoveryRetry"></span>
+    </section>
+
+    <section class="metrics" aria-label="账户与市场摘要">
+      <article><span>钱包可用</span><strong id="wallet">—</strong><small>USD</small></article>
+      <article><span>稳健锚点</span><strong id="anchor">—</strong><small>日利率</small></article>
+      <article><span>动态间距</span><strong id="step">—</strong><small>日利率</small></article>
+      <article><span>计划利用</span><strong id="planned">—</strong><small>USD</small></article>
+      <article><span>长期净 APR</span><strong id="longApr">—</strong><small>门槛</small></article>
+      <article><span>长期对应日利率</span><strong id="longDaily">—</strong><small>含 15% 费用换算</small></article>
+    </section>
+
+    <section class="grid two">
+      <article class="panel">
+        <div class="panel-title"><h2>市场确认</h2><span id="fresh" class="badge neutral">—</span></div>
+        <dl id="signals"></dl>
+      </article>
+      <article class="panel">
+        <div class="panel-title"><h2>运行模式</h2></div>
+        <p>SHADOW 只记录假设计划；LIVE 需要精确确认且受跨版本锁保护。</p>
+        <div class="actions">
+          <button data-mode="PAUSED">暂停</button>
+          <button data-mode="SHADOW" class="primary">影子运行</button>
+          <button data-mode="LIVE" class="danger">启用 V4 LIVE</button>
+        </div>
+        <p id="modeMessage" class="message"></p>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-title"><h2>V4 托管网格</h2><span id="pending">无待确认重建</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>资金池</th><th>档位</th><th>Offer ID</th><th>期限</th><th>原始金额</th><th>剩余金额</th><th>日利率</th><th>状态</th></tr></thead>
+          <tbody id="rungs"><tr><td colspan="8">暂无 V4 托管订单</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-title"><h2>策略配置</h2><span>保存后需重启 V4</span></div>
+      <form id="configForm" class="form-grid">
+        <label>短期最低净 APR (%)<input name="short_floor_apr_percent" type="number" step="0.01"></label>
+        <label>中期最低净 APR (%)<input name="medium_floor_apr_percent" type="number" step="0.01"></label>
+        <label>长期最低净 APR (%)<input name="long_floor_apr_percent" type="number" step="0.01"></label>
+        <label>短期权重<input name="short_weight" type="number" step="1"></label>
+        <label>中期权重<input name="medium_weight" type="number" step="1"></label>
+        <label>短期候选期限<input name="short_periods" placeholder="2,4,7"></label>
+        <label>中期候选期限<input name="medium_periods" placeholder="14,30"></label>
+        <label>短期最大档数<input name="short_max_rungs" type="number" min="1" max="10"></label>
+        <label>中期最大档数<input name="medium_max_rungs" type="number" min="1" max="10"></label>
+        <label>最小网格间距 (%)<input name="grid_min_step_percent" type="number" step="0.001"></label>
+        <label>最大网格间距 (%)<input name="grid_max_step_percent" type="number" step="0.001"></label>
+        <label>部分成交触发 (%)<input name="partial_fill_trigger_percent" type="number" step="1"></label>
+        <label>短期底线等待 (分钟)<input name="short_floor_stale_minutes" type="number"></label>
+        <label>中期底线等待 (分钟)<input name="medium_floor_stale_minutes" type="number"></label>
+        <label>长期底线等待 (分钟)<input name="long_floor_stale_minutes" type="number"></label>
+        <label>最大放贷额 (空为不限)<input name="max_lend_amount" type="number" step="0.01"></label>
+        <label>最大放贷比例 (%)<input name="max_lend_percent" type="number" step="1"></label>
+        <label class="check"><input name="adopt_external_offers" type="checkbox">允许人工接管外部可见 LIMIT 单</label>
+        <div class="form-actions"><button class="primary" type="submit">保存配置</button><span id="configMessage" class="message"></span></div>
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="panel-title"><h2>外部订单接管</h2><span>仅 PAUSED · 逐笔确认</span></div>
+      <p>未接管的人工/V3 订单始终只读。这里只接受配置已开放的可见 fUSD LIMIT 和 V4 支持期限。</p>
+      <div id="externalOffers" class="muted">最新快照中没有外部订单。</div>
+      <form id="adoptForm" class="actions">
+        <input id="adoptIds" aria-label="Offer IDs" placeholder="输入 Offer ID，逗号分隔">
+        <button type="submit">逐笔确认并接管</button>
+      </form>
+      <p id="adoptMessage" class="message"></p>
+    </section>
+
+    <section class="panel">
+      <div class="panel-title"><h2>最近安全事件</h2></div>
+      <ul id="events" class="events"><li>暂无事件</li></ul>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
