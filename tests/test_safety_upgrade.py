@@ -23,8 +23,6 @@ from StrategyResearch import (
     PublicRateLimiter,
     backfill_public_market_data,
     evaluate_strategies,
-    paired_bootstrap_interval,
-    research_variants,
     write_research_report,
 )
 from StrategyV3 import (
@@ -445,6 +443,69 @@ def test_definite_submit_rejection_closes_intent_without_safe(tmp_path):
     assert store.runtime()["mode"] == "LIVE"
 
 
+@pytest.mark.parametrize(
+    "outcome, expected_periods",
+    [
+        (WriteOutcome.CONFIRMED, [2, 120]),
+        (WriteOutcome.DEFINITE_REJECT, [2]),
+        (WriteOutcome.UNKNOWN, [2]),
+    ],
+)
+def test_secondary_submission_waits_for_short_confirmation(tmp_path, outcome, expected_periods):
+    store = LendingStateStore(tmp_path / "state.sqlite3")
+    store.set_mode("LIVE", "test")
+    first = WriteResult(outcome, response=[0, "ok", None, None, [9001]], error="short submit failed")
+    second = WriteResult(WriteOutcome.CONFIRMED, response=[0, "ok", None, None, [9002]])
+    client = SubmitClient(first)
+    client.submit_funding_offer_result = mock.Mock(side_effect=[first, second])
+    runtime = LendingRuntimeV3(client, policy(), store, hub=NullHub())
+    plan = {
+        "plan_hash": "short-first",
+        "requires_short_confirmation": True,
+        "plan": [order(), order(slice_index=1, pool="long", period=120, amount=D("250"))],
+    }
+
+    submitted = runtime._submit_plan(plan, D("400"), "v")
+
+    assert [call.args[3] for call in client.submit_funding_offer_result.call_args_list] == expected_periods
+    assert [row["period"] for row in submitted] == ([2, 120] if outcome == WriteOutcome.CONFIRMED else [])
+
+
+@pytest.mark.parametrize("reserved_for_reprice, expected_periods", [(D("150"), []), (D("0"), [2, 120])])
+def test_small_budget_waits_for_reprice_reservations(tmp_path, monkeypatch, reserved_for_reprice, expected_periods):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "state.sqlite3", clock=lambda: now / 1000)
+    store.set_mode("LIVE", "test")
+    wallet = D("400")
+    snapshot = {
+        "as_of": now,
+        "source": "WEBSOCKET",
+        "safeRequired": False,
+        "book": [{"period": period, "rate": D("0.0005"), "amount": D("-1000")} for period in (2, 120)],
+        "trades": [{"period": 120, "rate": D("0.0005"), "amount": D("200"), "mts": now - 1000}],
+        "wallets": [{"wallet_type": "funding", "currency": "USD", "balance": wallet, "available": wallet}],
+        "offers": [],
+        "credits": [],
+        "fundingTrades": [],
+    }
+    client = SimpleNamespace(
+        submit_funding_offer_result=mock.Mock(side_effect=[
+            WriteResult(WriteOutcome.CONFIRMED, response=[0, "ok", None, None, [offer_id]])
+            for offer_id in (9001, 9002)
+        ])
+    )
+    runtime = LendingRuntimeV3(client, policy(), store, hub=SimpleNamespace(snapshot=lambda _now: snapshot))
+    runtime._bootstrapped = True
+    runtime._last_rest_sync_ms = now
+    monkeypatch.setattr(
+        runtime, "_submit_pending_reprices", lambda *_args, **_kwargs: ([], wallet - reserved_for_reprice),
+    )
+
+    runtime.cycle(now)
+
+    assert [call.args[3] for call in client.submit_funding_offer_result.call_args_list] == expected_periods
+
+
 def matching_offer(offer_id, created=None):
     return {
         "id": offer_id,
@@ -797,13 +858,6 @@ def test_empty_authoritative_histories_automatically_resume_live(tmp_path):
     assert store.intent(intent["id"])["resolution"] == "AUTO_CONFIRMED_ABSENT"
 
 
-def test_rollout_stages_are_restricted(tmp_path):
-    store = LendingStateStore(tmp_path / "state.sqlite3")
-    assert store.set_rollout("candidate", 10)["candidate_share"] == 10
-    with pytest.raises(StateStoreError):
-        store.set_rollout("candidate", 30)
-
-
 def test_minute_book_snapshot_replaces_same_bucket(tmp_path):
     store = LendingStateStore(tmp_path / "state.sqlite3")
     store.record_book_snapshot([{"rate": "1"}], now_ms=61_000)
@@ -1081,7 +1135,7 @@ def test_public_backfill_retries_rate_limit_and_uses_endpoint_limits(tmp_path):
     )
     assert result["complete"] is True
     assert calls == {"trades": 2, "stats": 1, "stats_limit": 250}
-    assert sleeps == [30.0]
+    assert sleeps == [60.0]
 
 
 def synthetic_market(store, now):
@@ -1118,24 +1172,10 @@ def test_strategy_evaluation_uses_fixed_chronological_splits(tmp_path):
     assert report["selection"]["scenarioCount"] == 12
 
 
-def test_research_variants_preserve_hard_user_boundaries():
-    base = policy()
-    for variant in research_variants(base).values():
-        assert variant.max_lend_amount == base.max_lend_amount
-        assert variant.max_lend_percent == base.max_lend_percent
-        assert variant.short_floor_apr == base.short_floor_apr
-
-
 def test_score_weights_are_versioned_research_data_not_policy_fields():
     assert SCORE_MODEL_VERSION == "v3-score-2026-07-22"
     assert sum(V3_RESEARCH_SCORE_WEIGHTS.values(), D("0")) == D("100")
     assert not any(name.startswith("score_") for name in policy_v3_to_json(policy()))
-
-
-def test_paired_bootstrap_detects_consistent_positive_gain():
-    interval = paired_bootstrap_interval([D("0.2")] * 15, [D("0.1")] * 15, iterations=500)
-    assert interval["lower"] > 0
-    assert interval["samples"] == 15
 
 
 def test_research_report_is_stable_json(tmp_path):

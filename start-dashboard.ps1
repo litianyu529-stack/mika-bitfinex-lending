@@ -65,22 +65,28 @@ try {
     $listener = Get-Listener
     if ($listener) {
         $pidValue = [int]$listener.OwningProcess
-        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue"
         $health = Get-DashboardHealth
         $lock = Get-DashboardLockMetadata
-        $legacyConfig = Get-LegacyConfigPath
         $newIdentity = $health -and $health.service -eq "mika-lending-dashboard-v3" -and
             [IO.Path]::GetFullPath([string]$health.configPath) -eq $ConfigPath -and
             [IO.Path]::GetFullPath([string]$health.projectRoot) -eq [IO.Path]::GetFullPath($Root) -and
             [int]$health.pid -eq $pidValue -and $lock -and [int]$lock.pid -eq $pidValue -and
             [string]$lock.buildId -eq [string]$health.buildId -and
             [IO.Path]::GetFullPath([string]$lock.configPath) -eq $ConfigPath
-        $legacyIdentity = $process -and $process.Name -match '^python(?:w)?\.exe$' -and
-            $process.CommandLine -match '(?i)lendingbot\.py' -and $process.CommandLine -match '(?i)--dashboard' -and
-            $legacyConfig -and [IO.Path]::GetFullPath([string]$legacyConfig) -eq $ConfigPath
-        if (-not ($newIdentity -or $legacyIdentity)) {
-            $name = if ($process) { $process.Name } else { "unknown" }
-            throw "Port 8000 is owned by an unverified process (PID $pidValue, $name). The launcher will not terminate it."
+        if ($newIdentity -and $health.ok -eq $true -and $health.buildId -eq $ExpectedBuild) {
+            if ($env:MIKA_LAUNCHER_NO_BROWSER -ne "1") { Start-Process $AppUrl }
+            exit 0
+        }
+        if (-not $newIdentity) {
+            $process = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue"
+            $legacyConfig = Get-LegacyConfigPath
+            $legacyIdentity = $process -and $process.Name -match '^python(?:w)?\.exe$' -and
+                $process.CommandLine -match '(?i)lendingbot\.py' -and $process.CommandLine -match '(?i)--dashboard' -and
+                $legacyConfig -and [IO.Path]::GetFullPath([string]$legacyConfig) -eq $ConfigPath
+            if (-not $legacyIdentity) {
+                $name = if ($process) { $process.Name } else { "unknown" }
+                throw "Port 8000 is owned by an unverified process (PID $pidValue, $name). The launcher will not terminate it."
+            }
         }
         Write-Host "Safely replacing Dashboard PID $pidValue..."
         Stop-Process -Id $pidValue -Force

@@ -1,5 +1,6 @@
 from dataclasses import replace
 from decimal import Decimal as D
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import copy
@@ -14,6 +15,8 @@ from StrategyResearch import (
 from StateStore import LendingStateStore
 from StrategyV3 import StrategyPolicyV3, build_market_signals_v3, build_strategy_plan_v3
 from MarketHistory import RollingMarketWindows
+from bitfinex import BitfinexApiError, BitfinexTransientError
+from scripts import validate_v36
 
 
 NOW = 200 * DAY_MS
@@ -238,6 +241,49 @@ def test_backfill_saturated_millisecond_stays_unresolved_and_never_skips_ids(tmp
     assert report["trades"]["count"] == 2
 
 
+def test_backfill_full_page_revisits_boundary_timestamp_and_retries_transport(tmp_path):
+    store = LendingStateStore(tmp_path / "page.sqlite3")
+    start = NOW - 90 * DAY_MS
+    boundary = start + DAY_MS
+    rows = [[index, mts, "1000", ".001", 2] for index, mts in
+            enumerate([start + 1, boundary, boundary, boundary + 1], 1)]
+    calls, sleeps = [], []
+
+    def trades(symbol, start, end, limit, sort):
+        calls.append((start, end))
+        if len(calls) == 2:
+            raise BitfinexTransientError("connection ended")
+        return [row for row in rows if start <= row[1] <= end][:limit]
+
+    client = SimpleNamespace(funding_trades=trades, funding_stats=lambda *args, **kwargs: [])
+    report = backfill_public_market_data(client, store, now_ms=NOW, page_limit=3,
+                                         rate_limiter=SimpleNamespace(wait=lambda: None), retry_sleeper=sleeps.append)
+    assert report["complete"]
+    assert report["trades"]["count"] == 4
+    assert calls == [(start, NOW - 1), (boundary, NOW - 1), (boundary, NOW - 1), (boundary + 1, NOW - 1)]
+    assert len(sleeps) == 1
+
+
+def test_backfill_does_not_certify_unexpected_response(tmp_path):
+    store = LendingStateStore(tmp_path / "page.sqlite3")
+    client = SimpleNamespace(funding_trades=lambda *args, **kwargs: {})
+    with pytest.raises(BitfinexApiError, match="coverage not verified"):
+        backfill_public_market_data(client, store, now_ms=NOW, rate_limiter=SimpleNamespace(wait=lambda: None))
+    assert not store.market_coverage(NOW - 90 * DAY_MS, NOW)["complete"]
+
+
+def test_backfill_retries_rate_limit_object_before_certifying(tmp_path):
+    store = LendingStateStore(tmp_path / "page.sqlite3")
+    responses = iter([{"error": "ERR_RATE_LIMIT"}, []])
+    client = SimpleNamespace(funding_trades=lambda *args, **kwargs: next(responses),
+                             funding_stats=lambda *args, **kwargs: [])
+    sleeps = []
+    result = backfill_public_market_data(client, store, now_ms=NOW,
+                                         rate_limiter=SimpleNamespace(wait=lambda: None), retry_sleeper=sleeps.append)
+    assert result["complete"]
+    assert sleeps == [60.0]
+
+
 def test_backfill_minimum_and_maximum_existing_rows_do_not_prove_the_middle(tmp_path):
     store = LendingStateStore(tmp_path / "gapped.sqlite3")
     start = NOW - 90 * DAY_MS
@@ -251,6 +297,78 @@ def test_backfill_minimum_and_maximum_existing_rows_do_not_prove_the_middle(tmp_
                                          rate_limiter=SimpleNamespace(wait=lambda: None))
     assert report["complete"]
     assert "123" in {row["id"] for row in store.market_trades()}
+
+
+def isolated_research_store(tmp_path):
+    directory = tmp_path / "validation-v36-test"
+    directory.mkdir()
+    return LendingStateStore(directory / "isolated-v36.sqlite3")
+
+
+def test_isolated_backfill_resumes_only_unverified_intervals_at_the_saved_end(tmp_path, monkeypatch, capsys):
+    store = isolated_research_store(tmp_path)
+    start = NOW - 90 * DAY_MS
+    left, right = start + DAY_MS, NOW - DAY_MS
+    store.record_market_coverage(left, right)
+    calls = []
+
+    def trades(symbol, start, end, limit, sort):
+        calls.append((start, end))
+        if len(calls) == 2:
+            raise BitfinexApiError("simulated transport interruption")
+        return []
+
+    monkeypatch.setattr(validate_v36, "Bitfinex", lambda **kwargs: SimpleNamespace(
+        funding_trades=trades, funding_stats=lambda *args, **kwargs: []))
+    monkeypatch.setattr(validate_v36.ReportingRateLimiter, "wait", lambda self: None)
+    args = ["--database", store.path]
+    assert validate_v36.main([*args, "--check-coverage", "--end-ms", str(NOW)]) == 0
+    assert not json.loads(capsys.readouterr().out)["canReplay"]
+    assert validate_v36.main([*args, "--backfill"]) == 1
+    assert calls == [(start, left - 1), (right, NOW - 1)]
+    assert store.market_coverage(start, NOW)["coveredDurationMs"] == 89 * DAY_MS
+    store.upsert_market_trades([{"id": "new", "mts": NOW + 1000, "period": 2, "rate": ".001", "amount": "1"}])
+    assert validate_v36.main([*args, "--backfill"]) == 0
+    assert calls[-1:] == [(right, NOW - 1)]
+    assert len(calls) == 3
+    assert store.market_coverage(start, NOW)["complete"]
+
+
+def test_isolated_replay_resumes_finished_variants_and_invalidates_changed_input(tmp_path, monkeypatch, capsys):
+    store = isolated_research_store(tmp_path)
+    store.save_strategy(StrategyResearch.json_decimal(vars(policy())), "ACTIVE")
+    store.record_market_coverage(NOW - 90 * DAY_MS, NOW)
+    monkeypatch.setattr(validate_v36, "book_coverage", ready_coverage)
+    monkeypatch.setattr(StrategyResearch, "book_coverage", ready_coverage)
+    args = ["--database", store.path, "--end-ms", str(NOW)]
+    calls = []
+    replay = runner_calls(calls)
+
+    def interrupted(*args, **kwargs):
+        if calls:
+            raise KeyboardInterrupt
+        return replay(*args, **kwargs)
+
+    monkeypatch.setattr(validate_v36, "run_event_replay", interrupted)
+    assert validate_v36.main(args) == 130
+    output = Path(store.path).parent / "strategy-validation-report.json"
+    assert not output.exists()
+    assert len(calls) == 1
+    monkeypatch.setattr(validate_v36, "run_event_replay", replay)
+    assert validate_v36.main(args) == 0
+    assert len(calls) == 36
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["executionAudit"]["reusedVariants"] == 1
+    assert report["selection"]["scenarioCount"] == 12
+    assert report["selection"]["eligibleForLiveCandidate"]
+    assert any(json.loads(line)["phase"] == "variant_reused" for line in capsys.readouterr().out.splitlines())
+
+    store.upsert_market_trades([{"id": "new", "mts": NOW - 1000, "period": 2, "rate": ".001", "amount": "1"}])
+    calls.clear()
+    monkeypatch.setattr(validate_v36, "run_event_replay", interrupted)
+    assert validate_v36.main(args) == 130
+    assert len(calls) == 1
+    assert all(json.loads(line)["phase"] != "variant_reused" for line in capsys.readouterr().out.splitlines())
 
 
 @pytest.mark.parametrize("cleaning", ["legacy_global", "exact_term"])

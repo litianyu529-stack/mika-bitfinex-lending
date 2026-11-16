@@ -14,9 +14,12 @@ from decimal import Decimal, getcontext
 from http.server import ThreadingHTTPServer
 
 from bitfinex import APP_VERSION, Bitfinex, BitfinexApiError
+from ConnectionDiagnostics import ConnectionDiagnostics
 from Logger import Logger
 from AppContext import AppContext
-from ExchangeModels import funding_offer_effective_rate, parse_funding_stats, parse_funding_trades, parse_loan_rows
+from ExchangeModels import (
+    funding_offer_effective_rate, parse_account_rows, parse_funding_stats, parse_funding_trades, parse_loan_rows,
+)
 from StateStore import LendingStateStore, StaleStrategyVersion, StateStoreError
 from RuntimeV3 import (
     LendingRuntimeV3,
@@ -106,6 +109,7 @@ WORKER_BUILD_FILES = (
     "lendingbot.py",
     "DashboardServer.py",
     "bitfinex.py",
+    "ConnectionDiagnostics.py",
     "FileUtils.py",
     "Logger.py",
     "MarketDataStream.py",
@@ -307,17 +311,17 @@ def load_v3_account_context(client, store, now_ms):
     """Read the live account shape without changing exchange or local state."""
     basis = {"source": "REAL_ACCOUNT", "timestamp": int(now_ms), "stale": False, "warnings": []}
     try:
-        wallets = parse_wallet_rows_v3(client.wallets())
+        wallets = parse_account_rows(client.wallets(), parse_wallet_rows_v3, "wallets")
         try:
-            offers = parse_offer_rows_v3(client.active_funding_offers("fUSD"))
+            offers = parse_account_rows(client.active_funding_offers("fUSD"), parse_offer_rows_v3, "funding_offers")
         except AttributeError:
             offers = []
         try:
-            credits = parse_credit_rows_v3(client.active_funding_credits("fUSD"))
+            credits = parse_account_rows(client.active_funding_credits("fUSD"), parse_credit_rows_v3, "funding_credits")
         except AttributeError:
             credits = []
         try:
-            loans = parse_loan_rows(client.active_funding_loans("fUSD"))
+            loans = parse_account_rows(client.active_funding_loans("fUSD"), parse_loan_rows, "funding_loans")
         except AttributeError:
             loans = []
     except Exception as exc:
@@ -347,6 +351,7 @@ def load_v3_account_context(client, store, now_ms):
     for offer in offers:
         managed = managed_offers.get(int(offer["id"]))
         offer["managed"] = managed is not None
+        offer["pool"] = (managed or {}).get("pool") or pool_for_period(offer["period"])
         offer["layer"] = (managed or {}).get("layer")
         offer["pool"] = pool_for_period(offer["period"])
         offer["display_type"] = v3_offer_display_type(offer)
@@ -674,13 +679,7 @@ def runtime_v3_payload(config_path, context=None):
 
 def stats_v3_payload(store):
     return {
-        "statistics": {
-            "1d": store.statistics(1),
-            "7d": store.statistics(7),
-            "30d": store.statistics(30),
-            "90d": store.statistics(90),
-            "all": store.statistics(None),
-        },
+        "statistics": store.statistics_windows(),
         "realizedIncome": store.realized_income_summary("USD"),
         "incomeHistorySync": store.income_history_sync_payload("USD"),
     }
@@ -967,6 +966,10 @@ def dashboard_status_payload(status_path, config_path, context=None):
             empty["process"] = process
             return empty
         payload["runtime"] = runtime
+        worker_recovery = payload.get("recovery") or {}
+        if (recovery["active"] and worker_recovery.get("lastFailedEndpoint")
+                and all(worker_recovery.get(key) == recovery[key] for key in ("startedAt", "lastProbeAt"))):
+            recovery["lastFailedEndpoint"] = worker_recovery["lastFailedEndpoint"]
         payload["recovery"] = recovery
         payload["process"] = process
         payload["operationMode"] = runtime["mode"]
@@ -1901,32 +1904,40 @@ def stop_web_server(log, context=None):
         log.log(f"停止网页控制台失败：{exc}")
 
 
-def publish_safe_status(log, store, exc):
+def publish_safe_status(log, store, exc, diagnostics=None):
     decision = classify_runtime_error(exc)
     reason = f"{decision.category}:{type(exc).__name__}"
     current = store.runtime()
+    recovery = store.recovery_status()
     if decision.retryable:
-        recovery = store.recovery_status()
-        origin = recovery.get("targetMode") or current["previous_mode"] or current["mode"]
-        if current["mode"] != "PAUSED":
-            runtime = store.set_mode("PAUSED", f"AUTO_RECOVERY:{decision.category}")
-        else:
-            runtime = current
-        store.begin_recovery(
-            decision.category,
-            str(exc),
-            origin_mode=origin,
-            target_mode=origin,
-            manual_required=False,
-        )
-        store.record_recovery_failure(str(exc), decision.category)
+        episode = recovery
+        if not episode["active"] and current["mode"] == "LIVE":
+            episode = store.begin_recovery(
+                decision.category, str(exc), origin_mode="LIVE", target_mode="LIVE", pause_live=True,
+            )
+        elif not episode["active"] and current["mode"] != "PAUSED":
+            store.set_mode("PAUSED", f"AUTO_RECOVERY:{decision.category}")
+            episode = store.begin_recovery(
+                decision.category, str(exc), origin_mode=current["mode"], target_mode=current["mode"],
+            )
+        if episode["active"]:
+            store.record_recovery_failure(exc, decision.category, expected_started_at=episode["startedAt"])
+        runtime = store.runtime()
     else:  # Defensive fallback if a future classifier adds a non-retryable type.
         runtime = store.set_mode("PAUSED", reason)
         store.begin_recovery(decision.category, str(exc), origin_mode=current["mode"], target_mode=current["mode"])
+    if diagnostics is not None:
+        diagnostics.worker_rest_failure(
+            exc, decision.category, previous_mode=current["mode"], recovering=recovery["active"],
+        )
     log.updateMetaValue("schemaVersion", STATUS_SCHEMA_VERSION)
     log.updateMetaValue("operationMode", runtime["mode"])
     log.updateMetaValue("runtime", runtime)
-    log.updateMetaValue("recovery", store.recovery_status())
+    recovery_status = store.recovery_status()
+    endpoint = getattr(exc, "rest_request", {}).get("endpoint")
+    if recovery_status["active"] and endpoint:
+        recovery_status["lastFailedEndpoint"] = endpoint
+    log.updateMetaValue("recovery", recovery_status)
     log.refreshStatus(f"{runtime['mode']}：{type(exc).__name__}：{exc}")
     log.persistStatus()
     return runtime
@@ -2138,14 +2149,13 @@ def main(argv=None):
     if not live_lock.acquire(args.config, {"role": "live_worker", "service": "mika-lending-worker-v3"}):
         log.log("实盘启动被拒绝：另一个机器人进程已持有单实例锁。")
         return 1
-    state_store_v3 = LendingStateStore(settings.state_db_file, clock=context.now)
-    active, active_policy = ensure_active_strategy_v3(state_store_v3, settings)
-    if active["version_id"] != preflight["summary"].get("activeStrategyVersion"):
-        live_lock.release()
-        log.log("实盘启动被拒绝：预检后 ACTIVE 已变化，请重新预检。")
-        return 1
     log.log("实盘预检通过，开始同步账户并执行策略。")
-    client = Bitfinex(settings.api_key, settings.api_secret)
+    diagnostics_path = os.path.join(os.path.dirname(settings.state_db_file), "connection-events.jsonl")
+    diagnostics = ConnectionDiagnostics(diagnostics_path)
+    diagnostics.worker_started()
+    client = Bitfinex(settings.api_key, settings.api_secret, diagnostics=diagnostics)
+    state_store_v3 = LendingStateStore(settings.state_db_file, clock=context.now)
+    _, active_policy = ensure_active_strategy_v3(state_store_v3, settings)
     # Preserve a durable protected PAUSED across process restarts so bootstrap can reconcile
     # the uncertain exchange write from authoritative account data. Normal
     # PAUSED starts still transition directly to LIVE after the confirmed preflight.
@@ -2159,6 +2169,7 @@ def main(argv=None):
         auto_transfer_wallets=(settings.transfer_from_wallets if "USD" in settings.transferable_currencies else ()),
         on_policy_activated=lambda policy, _version: mirror_active_strategy_v3(args.config, policy),
         clock=context.now,
+        diagnostics=diagnostics,
     )
 
     if settings.web_server:
@@ -2169,13 +2180,12 @@ def main(argv=None):
         )
         thread.start()
 
-    sleep_time = settings.sleep_active
     deferred_recovery_error = None
     try:
         while True:
             if deferred_recovery_error is not None:
                 try:
-                    publish_safe_status(log, state_store_v3, deferred_recovery_error)
+                    publish_safe_status(log, state_store_v3, deferred_recovery_error, diagnostics)
                 except Exception as persist_exc:
                     if not classify_runtime_error(persist_exc).retryable:
                         return 1
@@ -2184,19 +2194,20 @@ def main(argv=None):
                 deferred_recovery_error = None
                 # Persisting recovery is a read-only cycle. Strategy writes are
                 # deferred until a later normal cycle.
-                time.sleep(30)
+                runtime_v3.wait_for_next_cycle(settings.sleep_active)
                 continue
             try:
-                runtime_v3.cycle()
-                sleep_time = 30 if state_store_v3.recovery_status()["active"] else settings.sleep_active
+                status = runtime_v3.cycle()
                 if settings.once:
                     break
-                time.sleep(sleep_time)
+                resumed = (status["operationMode"] == "LIVE"
+                           and (status["strategyV3"] or {}).get("recoveryResumeBarrier", False))
+                runtime_v3.wait_for_next_cycle(settings.sleep_active, resumed=resumed)
             except Exception as exc:
                 log.log("错误：" + str(exc))
                 decision = classify_runtime_error(exc)
                 try:
-                    publish_safe_status(log, state_store_v3, exc)
+                    publish_safe_status(log, state_store_v3, exc, diagnostics)
                 except Exception as persist_exc:
                     if decision.retryable and classify_runtime_error(persist_exc).retryable:
                         deferred_recovery_error = exc
@@ -2215,8 +2226,10 @@ def main(argv=None):
                             deferred_recovery_error = exc
                         else:
                             return 1
-                sleep_time = 30
-                time.sleep(sleep_time)
+                if deferred_recovery_error is None:
+                    runtime_v3.wait_for_next_cycle(settings.sleep_active)
+                else:
+                    time.sleep(30)
     except KeyboardInterrupt:
         pass
     finally:

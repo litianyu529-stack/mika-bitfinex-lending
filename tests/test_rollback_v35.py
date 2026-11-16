@@ -27,8 +27,6 @@ def sources(tmp_path):
     store = LendingStateStore(source, clock=lambda: 1_000)
     payload = policy_v3_to_json(
         StrategyPolicyV3(
-            max_lend_amount=Decimal("2500"),
-            max_lend_percent=Decimal("65"),
             short_floor_apr=Decimal(".0623"),
             medium_floor_apr=Decimal(".0785"),
             long_floor_apr=Decimal(".0853"),
@@ -61,10 +59,7 @@ def test_migration_preserves_records_and_revokes_live(tmp_path):
     assert restored.offers()[0]["offer_id"] == 42
     assert restored.offers()[0]["managed"] == 0
     assert result["strategyConfig"]["short_floor_apr"] == "6.23"
-    assert result["strategyConfig"]["max_lend_amount"] == "2500"
-    assert result["strategyConfig"]["max_lend_percent"] == "65"
-    with restored.read_connection() as connection:
-        assert connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0] == "19"
+    assert result["strategyConfig"]["max_lend_amount"] == ""
     assert restored.strategy("DRAFT") is None
     with closing(sqlite3.connect(source)) as db, db:
         assert db.execute("SELECT mode FROM runtime_state").fetchone()[0] == "LIVE"

@@ -1,8 +1,28 @@
 from decimal import Decimal
+from bitfinex import BitfinexApiError
 
 
 D = Decimal
 FRR_OFFSET_OFFER_TYPES = {"FRRDELTAFIX", "FRRDELTAVAR"}
+
+
+def parse_account_rows(rows, parser, endpoint, currency="USD"):
+    """An authoritative read may be empty, but may not silently drop rows."""
+    invalid = BitfinexApiError(f"Invalid account response: {endpoint}", category="INVALID_ACCOUNT_RESPONSE")
+    if not isinstance(rows, (list, tuple)):
+        raise invalid
+    parsed = parser(rows, currency="")
+    if len(parsed) != len(rows):
+        raise invalid
+    identities = set()
+    for raw, row in zip(rows, parsed):
+        if not isinstance(raw[1], str) or not raw[1].strip():
+            raise invalid
+        identity = row.get("id", (row.get("wallet_type"), row["currency"]))
+        if identity in identities or any(isinstance(value, D) and not value.is_finite() for value in row.values()):
+            raise invalid
+        identities.add(identity)
+    return [row for row in parsed if not currency or row["currency"] == currency]
 
 
 def funding_offer_effective_rate(offer, frr_daily_rate=None):

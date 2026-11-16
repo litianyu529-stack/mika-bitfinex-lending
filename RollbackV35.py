@@ -1,4 +1,4 @@
-"""Offline projection of USD records via a Schema 16 backup into the current V3 schema.
+"""Offline, lossless projection of USD operational records into Schema 16.
 
 Run only after all lending and dashboard processes have stopped. Sources are
 opened read-only; a failed migration removes only its newly created output.
@@ -10,6 +10,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
+from decimal import Decimal
 
 from Configuration import strategy_v3_config_values
 from StateStore import LendingStateStore
@@ -70,6 +71,7 @@ def migrate(source, legacy_backup, output):
             policy = validate_policy_v3(
                 policy_v3_with_overrides(StrategyPolicyV3(), {k: v for k, v in payload.items() if k in fields})
             )
+            policy = policy_v3_with_overrides(policy, {"max_lend_amount": None, "max_lend_percent": Decimal("100")})
             target = sqlite3.connect(output, uri=True)
             try:
                 original.backup(target)

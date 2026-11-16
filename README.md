@@ -1,6 +1,6 @@
 # Mika Lending Bot · Bitfinex USD 自动放贷
 
-[![Windows verification](https://github.com/litianyu529-stack/mika-bitfinex-lending/actions/workflows/windows-verify.yml/badge.svg?branch=release%2Fv0.3.6.1-rc.1)](https://github.com/litianyu529-stack/mika-bitfinex-lending/actions/workflows/windows-verify.yml)
+[![Windows verification](https://github.com/litianyu529-stack/mika-bitfinex-lending/actions/workflows/windows-verify.yml/badge.svg?branch=release%2Fv0.3.6.2-rc.1)](https://github.com/litianyu529-stack/mika-bitfinex-lending/actions/workflows/windows-verify.yml)
 [![正式版](https://img.shields.io/github/v/release/litianyu529-stack/mika-bitfinex-lending?label=stable)](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -8,7 +8,7 @@
 
 *Automated Bitfinex USD funding for Windows with a local dashboard, configurable lending limits, and order reconciliation.*
 
-**[下载 v0.3.6.1-rc.1 预览版](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/tag/v0.3.6.1-rc.1)** · [下载正式版](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/latest) · [Windows 快速开始](#快速开始) · [反馈问题](https://github.com/litianyu529-stack/mika-bitfinex-lending/issues)
+**[下载 v0.3.6.2-rc.1 预览版](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/tag/v0.3.6.2-rc.1)** · [下载正式版](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/latest) · [Windows 快速开始](#快速开始) · [反馈问题](https://github.com/litianyu529-stack/mika-bitfinex-lending/issues)
 
 ![Mika Lending Bot 总览，显示模拟余额、资金分布和挂单状态](docs/dashboard-preview.png)
 
@@ -21,7 +21,7 @@
 > [!WARNING]
 > 实盘模式会在 Bitfinex 执行真实资金操作。首次使用请先在暂停模式核对 API 权限、资金上限和最低净年化。
 
-本分支对应 `0.3.6.1-rc.1` 预览版，包含两小时手动订单保护和 Schema 19。默认使用 V3.5 报价机制。
+本分支对应 `0.3.6.2` 预览版，包含两小时手动订单保护和 Schema 19。默认使用 V3.5 报价机制。
 
 ## 安全边界
 
@@ -30,7 +30,7 @@
 - 机器人只撤改 SQLite 中能够证明归属的挂单。V3.5 对外部 fUSD 挂单执行两次至少间隔 30 秒且账户守恒的权威快照确认，确认后自动托管并只按具体 Offer ID 撤销；手动新挂／修改订单按交易所操作时间保护 120 分钟，再次手动修改重新计时，正常部分成交不重置；强制安全规则可提前处理。详见 [手动订单保护](docs/manual-order-protection.md)。外部 Credits 不接管、不关闭。
 - 短/中/长目标按当前托管未成交挂单与可用余额计算；已成交 Credits 计入资金上限，并参与已归属层级的目标缺口。超配池或期限通过后续新增资金逐步收敛，比例变化本身不会撤销已有有效订单。
 - 提交、撤单和钱包转账统一区分 `CONFIRMED / DEFINITE_REJECT / UNKNOWN`。请求发出后的超时、断线、截断响应、非法 JSON 或提交成功但缺少 Offer ID 都属于 `UNKNOWN`；先停止写入并对账，不会盲目重复请求。
-- 除人工暂停/停止外，网络、认证、配置、市场数据、账户数据、程序异常和 Worker 重启故障都会统一进入 PAUSED 的只读恢复循环，并在两次完整 REST 同步（至少间隔 30 秒）后自动恢复此前模式。不确定撤单会用 Offers 快照确认存在或消失后恢复；不确定提交会用请求时间附近的 Offers、Funding Trades 和历史 Offers 唯一绑定，或在两次权威快照确认不存在后关闭。多个候选会持续自动对账，但在无法唯一确认前绝不重新写入。
+- 纯网络断连后按 5–120 秒退避重试。新的 USD 挂单变更可以提前触发只读对账。两次完整 REST 对账均通过且没有未决操作时恢复 LIVE，第二次从首次对账完成后 15 秒发起。账户异常和未决交易沿用各自的安全确认流程。
 - WebSocket 每代连接必须重新收到 Book、Wallet、Offers、Credits 快照；新 Book snapshot 会清空上一代盘口。快照未齐全时只能使用新鲜 REST 完整降级数据。
 - Dashboard 只绑定 `127.0.0.1:8000`。所有 POST 要求同源 Host/Origin、随机 CSRF 头、JSON Content-Type，且请求体不超过 64 KiB。
 - SQLite 使用显式 Schema 19 和 V3 家族标记，16／18 可增量迁移，旧 V4 的 17 继续拒绝。升级前在线备份，迁移在事务中完成；人工 PAUSED 状态不会因迁移自动启动。
@@ -119,7 +119,7 @@ python -m pip install -r requirements-dev.txt
 
 ## 版本与文件
 
-- 应用/User-Agent：`0.3.6.1-rc.1`
+- 应用/User-Agent：`0.3.6.2`
 - Dashboard：按内容生成 build hash
 - 核心入口：`lendingbot.py --dashboard`、`lendingbot.py --live`
 - 状态库：`.state/lendingbot-v3.sqlite3`

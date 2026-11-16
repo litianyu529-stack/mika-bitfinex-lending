@@ -429,6 +429,9 @@ class MarketHistoryService:
         self._queue, self._jobs = deque(), deque()
         self._queued_count = 0
         self._policies, self._published = OrderedDict(), {}
+        self._published_status = None
+        self.book_source = None
+        self._last_book_bucket = -1
         self._warmed = False
         self._last_error = None
         self._source_sequence = 0
@@ -683,6 +686,19 @@ class MarketHistoryService:
     def _coverage(self, start, end):
         return self.store.market_coverage(start, end)
 
+    def _capture_minute_book(self, now, now_ms):
+        if self.book_source is None or now // MINUTE_MS <= self._last_book_bucket:
+            return
+        observation = self.book_source(now_ms)
+        if observation is None:
+            return
+        observed_at_ms, book = observation
+        bucket = observed_at_ms // MINUTE_MS
+        if bucket > self._last_book_bucket and self.store.record_book_snapshot(
+            book, source="WEBSOCKET", now_ms=observed_at_ms, defer_if_busy=True,
+        ):
+            self._last_book_bucket = bucket
+
     def _backfill_once(self, now):
         if self.public_client is None:
             return
@@ -763,12 +779,11 @@ class MarketHistoryService:
             self._load_markers(now)
             self._trim_quarantine(now)
             self._persist_quarantine()
+            self._capture_minute_book(now, now_ms)
             if not self._warmed:
                 self._source_sequence = self._sequence()
                 self._load(now - HISTORY_MS - MINUTE_MS, now + 1)
                 self._warmed = True
-            with self._lock:
-                policies = list(self._policies.items())
             for _ in range(8):
                 pending = self._take_batch()
                 if pending is None:
@@ -813,19 +828,24 @@ class MarketHistoryService:
             if self._last_error and state != "READY":
                 state = "DEGRADED"
             self._rolling.advance(asof)
+            metadata = {
+                "schemaVersion": 1, "cleaningVersion": CLEANING_VERSION,
+                "snapshotKind": "EXACT_TERM_FULL_WINDOW", "asOfMs": asof, "computedAtMs": now,
+                "coverage": {"startMs": asof - HISTORY_MS, "endMs": asof, **coverage},
+                "state": state, "status": state, "usable": state == "READY",
+                "sourceSequence": self._source_sequence, "fallbackState": None if state == "READY" else "LEGACY_INPUT",
+                "lastSuccessfulIngestMs": self._last_observed_ms, "lastError": self._last_error,
+                "pendingBackfillIntervals": len(self._jobs) + len(self._repair_jobs),
+                "droppedBatches": self._dropped_batches, "quarantinedIntervals": quarantine_intervals,
+                "invalidRecords": self._invalid_records, "queuedTradeCount": self._queued_count,
+                "publishedAtMs": int(self.clock() * 1000),
+            }
+            with self._lock:
+                self._published_status = metadata
+                policies = list(self._policies.items())
             for fingerprint, policy in policies:
                 payload = self._rolling.snapshot(policy, asof, coverage_complete=bool(coverage.get("complete")))
-                payload.update(
-                    state=state, status=state, usable=state == "READY", computedAtMs=now,
-                    sourceSequence=self._source_sequence, fallbackState=None if state == "READY" else "LEGACY_INPUT",
-                    lastSuccessfulIngestMs=self._last_observed_ms, lastError=self._last_error,
-                    pendingBackfillIntervals=len(self._jobs) + len(self._repair_jobs),
-                    droppedBatches=self._dropped_batches,
-                    quarantinedIntervals=quarantine_intervals,
-                    invalidRecords=self._invalid_records, queuedTradeCount=self._queued_count,
-                )
-                payload["coverage"].update(coverage)
-                payload["publishedAtMs"] = int(self.clock() * 1000)
+                payload.update(metadata, publishedAtMs=int(self.clock() * 1000))
                 with self._lock:
                     if fingerprint in self._policies:
                         self._published[fingerprint] = payload
@@ -840,36 +860,46 @@ class MarketHistoryService:
                     removed, _policy = self._policies.popitem(last=False)
                     self._published.pop(removed, None)
             self._policies.move_to_end(fingerprint)
-            payload = self._published.get(fingerprint)
-            result = copy.deepcopy(payload) if payload is not None else None
-            # A publisher may advance asOfMs while this reader waits for the
-            # lock. Observe wall time after taking its payload, so fresh data
-            # cannot appear to come from the future. Explicit replay times stay
-            # fixed and retain the strict future-data check below.
-            now = int(now_ms if now_ms is not None else self.clock() * 1000)
-            if result is None:
-                result = {
-                    "policyFingerprint": fingerprint, "cleaningVersion": CLEANING_VERSION,
-                    "state": "WARMING", "status": "WARMING", "usable": False,
-                    "asOfMs": None, "computedAtMs": None, "fallbackState": "LEGACY_INPUT",
-                    "coverage": {"startMs": now - HISTORY_MS, "endMs": now, "complete": False},
-                }
-            quarantined = self._quarantine_active
-            pending = [list(interval) for interval in self._quarantine_intervals]
-            reason = self._quarantine_reason
-        if quarantined:
-            result.update(state="DEGRADED", status="DEGRADED", usable=False, fallbackState="LEGACY_INPUT",
-                          quarantinedIntervals=pending, lastError=reason)
-            result["coverage"]["complete"] = False
-        if result.get("asOfMs") is not None and not 0 <= now - int(result["asOfMs"]) <= MINUTE_MS:
-            result.update(state="STALE", status="STALE", usable=False, fallbackState="LEGACY_INPUT")
+            result = self._read_publication(self._published.get(fingerprint), now_ms)
+            result["policyFingerprint"] = fingerprint
         self._wake.set()
         return result
 
+    def _read_publication(self, payload, now_ms):
+        # Called under the lock. Implicit time must be sampled after copying the
+        # publication. Explicit replay time retains the future-data guard.
+        result = copy.deepcopy(payload)
+        now = int(now_ms if now_ms is not None else self.clock() * 1000)
+        if result is None:
+            result = {
+                "cleaningVersion": CLEANING_VERSION,
+                "state": "WARMING", "status": "WARMING", "usable": False,
+                "asOfMs": None, "computedAtMs": None, "fallbackState": "LEGACY_INPUT",
+                "coverage": {"startMs": now - HISTORY_MS, "endMs": now, "complete": False},
+            }
+        if self._quarantine_active:
+            result.update(state="DEGRADED", status="DEGRADED", usable=False, fallbackState="LEGACY_INPUT",
+                          quarantinedIntervals=[list(interval) for interval in self._quarantine_intervals],
+                          lastError=self._quarantine_reason)
+            result["coverage"]["complete"] = False
+        if result.get("asOfMs") is not None and not 0 <= now - int(result["asOfMs"]) <= MINUTE_MS:
+            result.update(state="STALE", status="STALE", usable=False, fallbackState="LEGACY_INPUT")
+        return result
+
     def status(self, policy, now_ms=None):
-        payload = self.snapshot(policy, now_ms)
-        return {key: value for key, value in payload.items()
-                if key not in {"global", "windows", "periodDemand", "byPeriod", "periodWindows"}}
+        fingerprint = policy_fingerprint(policy)
+        with self._lock:
+            result = self._read_publication(self._published_status, now_ms)
+        result["policyFingerprint"] = fingerprint
+        if result["asOfMs"] is not None:
+            result.update(rawTradeCount=None, validTradeCount=None, priceSampleCount=None, filteredCount=None)
+        return result
+
+    def retain_snapshots(self, fingerprints):
+        with self._lock:
+            for fingerprint in self._policies.keys() - fingerprints:
+                del self._policies[fingerprint]
+                self._published.pop(fingerprint, None)
 
     def _run(self):
         while not self._stop.is_set():

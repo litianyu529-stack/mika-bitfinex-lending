@@ -195,15 +195,30 @@ def test_invalid_quote_configuration_is_rejected(mode, premium):
 def test_runtime_certificate_gate_and_quality_fallback(tmp_path, monkeypatch):
     p = policy()
     trades, window = market(p)
-    history = SimpleNamespace(snapshot=lambda *args: deepcopy(window))
+    calls = []
+
+    def snapshot_reader(*args):
+        calls.append("snapshot")
+        return deepcopy(window)
+
+    def status_reader(*args):
+        calls.append("status")
+        return {"state": "READY", "usable": True}
+
+    history = SimpleNamespace(snapshot=snapshot_reader, status=status_reader)
     runtime = LendingRuntimeV3(SimpleNamespace(), p, LendingStateStore(tmp_path / 'state.db'),
                                hub=SimpleNamespace(), history_service=history)
     snapshot = {'book': [], 'trades': trades}
     sig = runtime._market_signals(snapshot, p, NOW)
     assert not sig['completeWindowUsable']
     assert runtime._history_status['fallbackReason'] == 'VALIDATION_GATE_NOT_PASSED'
+    assert calls == ["status"]
     monkeypatch.setattr(RuntimeV3, 'validation_status', lambda *args: {'approved': True})
+    legacy = replace(p, quick_pricing_mode=LEGACY_QUICK_MODE)
+    assert not runtime._market_signals(snapshot, legacy, NOW)['completeWindowUsable']
+    assert calls == ["status", "status"]
     assert runtime._market_signals(snapshot, p, NOW)['quickPricingEnabled']
+    assert calls[-1] == "snapshot"
     window['coverage']['complete'] = False
     window['state'] = 'BACKFILLING'
     sig = runtime._market_signals(snapshot, p, NOW)
@@ -269,8 +284,8 @@ def test_cycle_observes_post_rest_window_at_decision_time(tmp_path, monkeypatch,
         )
         return hub.snapshot(NOW)
 
-    monkeypatch.setattr(RuntimeV3, 'validation_status',
-                        lambda *_: {'approved': True, 'reportDigest': '0' * 64})
+    validated = {'approved': True, 'reportDigest': 'a' * 64}
+    monkeypatch.setattr(RuntimeV3, 'validation_status', lambda *_: validated)
     monkeypatch.setattr(runtime, 'sync_rest', slow_rest)
     monkeypatch.setattr(runtime, '_strategy_status', lambda snapshot, signals, result: signals)
     result = runtime.cycle(NOW) if explicit_time else runtime.cycle()

@@ -191,7 +191,7 @@ def concurrent_stress(path, output, burst_count=6):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True)
-    parser.add_argument("--output", default=".state/research/v3.6-performance-and-migration.json")
+    parser.add_argument("--output", default="docs/v3.6-performance-and-migration.json")
     parser.add_argument("--stress-minutes", type=int, default=30)
     parser.add_argument("--concurrent-only", action="store_true")
     args = parser.parse_args()

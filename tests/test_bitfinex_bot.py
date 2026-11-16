@@ -174,7 +174,7 @@ def build_strategy_settings(extra_bot=None):
 
 class BitfinexBotTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual(APP_VERSION, "0.3.6.1-rc.1")
+        self.assertEqual(APP_VERSION, "0.3.6.2")
 
     def test_auth_headers_signature(self):
         client = Bitfinex("key", "secret")

@@ -1,11 +1,13 @@
 import random
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import replace
 from decimal import Decimal as D
 from types import SimpleNamespace
 
 import pytest
 
+import lendingbot
 import RuntimeV3
 import StateStore
 from StateStore import LendingStateStore
@@ -113,6 +115,60 @@ def test_performance_indexes_upgrade_once_without_replaying_state_migrations(tmp
     finally:
         writer.rollback()
         writer.close()
+
+
+def test_statistics_windows_share_one_read_and_measure_coverage_across_gaps(tmp_path, monkeypatch):
+    now = 2_000_000_000_000
+    start = now - 86_400_000
+    store = LendingStateStore(tmp_path / "state.sqlite3", clock=lambda: now / 1000)
+    for mts, credits in ((start - 60_000, 1000), (start + 60_000, 0), (now - 60_000, 1000), (now + 1, 0)):
+        store.record_account_sample(1000, 1000 - credits, 0, credits, 0, mts)
+    store.upsert_income_ledgers([
+        {"id": index, "currency": "USD", "wallet": "funding", "amount": amount, "mts": mts}
+        for index, (mts, amount) in enumerate(((start - 1, 2), (now - 1, 3), (now, -7), (now + 1, 99)), 1)
+    ])
+    read = store.read_connection
+    statements = []
+
+    @contextmanager
+    def traced_read():
+        with read() as connection:
+            connection.set_trace_callback(statements.append)
+            yield connection
+
+    monkeypatch.setattr(store, "read_connection", traced_read)
+    windows = store.statistics_windows(now_ms=now)
+    assert list(windows) == ["1d", "7d", "30d", "90d", "all"]
+    assert all(row["calculatedAtMs"] == now for row in windows.values())
+    day = windows["1d"]
+    assert day["sampleFrom"] == start + 60_000
+    assert day["sampleTo"] == now - 60_000
+    assert day["netInterest"] == "3"
+    assert windows["all"]["netInterest"] == "5"
+    assert D(day["sampleCoveragePercent"]) == D(240_000) / D(86_400_000) * 100
+    assert D(day["observedUtilizationPercent"]) == 50
+    assert statements.count("BEGIN") == 1
+    for table in ("funding_trades", "ledger_entries", "credit_closures"):
+        assert sum(f"FROM {table}" in statement for statement in statements) == 1
+
+
+def test_worker_caches_history_for_five_minutes_and_explicit_query_reads_fresh(tmp_path):
+    now = 2_000_000_000_000
+    clock_ms = [now]
+    store = LendingStateStore(tmp_path / "state.sqlite3", clock=lambda: clock_ms[0] / 1000)
+    runtime = RuntimeV3.LendingRuntimeV3(SimpleNamespace(), StrategyPolicyV3(), store, hub=SimpleNamespace())
+    first = runtime._statistics_snapshot(now)
+    clock_ms[0] = now + 299_999
+    store.upsert_income_ledgers([{"id": 1, "wallet": "funding", "amount": 3, "mts": clock_ms[0]}])
+
+    assert runtime._statistics_snapshot(clock_ms[0]) is first
+    fresh = lendingbot.stats_v3_payload(store)["statistics"]
+    assert fresh["all"]["calculatedAtMs"] == clock_ms[0]
+    assert fresh["all"]["netInterest"] == "3"
+    assert first["all"]["netInterest"] == "0"
+    updated = runtime._statistics_snapshot(now + 300_000)
+    assert updated["all"]["netInterest"] == "3"
+    assert updated["all"]["calculatedAtMs"] == now + 300_000
 
 
 @pytest.mark.parametrize("activate_pending", [False, True])

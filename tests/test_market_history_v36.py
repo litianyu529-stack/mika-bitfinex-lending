@@ -4,7 +4,8 @@ import random
 import tempfile
 import sqlite3
 import threading
-from contextlib import ExitStack, closing, contextmanager
+from contextlib import contextmanager
+from contextlib import closing
 from collections import deque
 from dataclasses import replace
 from decimal import Decimal
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+import MarketDataStream
 from ExchangeModels import parse_funding_trades
 from MarketDataStream import BitfinexMarketDataHub
 from MarketHistory import (
@@ -22,6 +24,7 @@ from MarketHistory import (
     compute_window_snapshot,
     policy_fingerprint,
 )
+from StateStore import LendingStateStore
 from StrategyV3 import StrategyPolicyV3 as PolicyV3, _window_statistics, filter_supported_trades
 
 
@@ -101,17 +104,6 @@ class MemoryStore:
                       and row["startMs"] < end_ms and row["endMs"] > start_ms]
         return {"complete": not gaps and not unresolved, "unresolvedIntervals": gaps + unresolved,
                 "coveredIntervals": [row for row in self.covered if row["status"] == "COMPLETE"]}
-
-
-@pytest.fixture
-def memory_store():
-    with ExitStack() as resources:
-        def create(rows=()):
-            store = MemoryStore(rows)
-            resources.callback(store._metadata.close)
-            return store
-
-        yield create
 
 
 class PublicClient:
@@ -200,8 +192,8 @@ def test_incremental_statistics_match_batch_after_late_data_and_window_rollover(
         assert actual == expected
 
 
-def test_warm_start_reads_durable_history_and_ready_requires_verified_coverage(memory_store):
-    store = memory_store([trade("old", NOW - HISTORY_MS + 1000), trade("now")])
+def test_warm_start_reads_durable_history_and_ready_requires_verified_coverage():
+    store = MemoryStore([trade("old", NOW - HISTORY_MS + 1000), trade("now")])
     history, policy = service(store), PolicyV3()
     assert history.snapshot(policy, NOW)["state"] == "WARMING"
     history.process_once(NOW, backfill=False)
@@ -215,8 +207,8 @@ def test_warm_start_reads_durable_history_and_ready_requires_verified_coverage(m
     assert history.snapshot(policy, NOW + 60_001)["state"] == "STALE"
 
 
-def test_busy_ingest_is_retained_for_retry_and_never_blocks_snapshot(memory_store):
-    store, policy = memory_store(), PolicyV3()
+def test_busy_ingest_is_retained_for_retry_and_never_blocks_snapshot():
+    store, policy = MemoryStore(), PolicyV3()
     history = service(store)
     history.snapshot(policy, NOW)
     history.ingest([trade(1)], NOW)
@@ -228,8 +220,8 @@ def test_busy_ingest_is_retained_for_retry_and_never_blocks_snapshot(memory_stor
     assert list(store.rows) == ["1"]
 
 
-def test_backfill_splits_full_pages_and_marks_saturated_millisecond_unresolved(memory_store):
-    store = memory_store()
+def test_backfill_splits_full_pages_and_marks_saturated_millisecond_unresolved():
+    store = MemoryStore()
     client = PublicClient([[1, NOW - 1, "-10", ".0002", 2], [2, NOW - 1, "20", ".0002", 2]])
     history = service(store, client, page_limit=2)
     history._jobs.append((NOW - 1, NOW))
@@ -239,8 +231,8 @@ def test_backfill_splits_full_pages_and_marks_saturated_millisecond_unresolved(m
     assert client.calls[0][1]["end"] == NOW - 1
 
 
-def test_backfill_empty_success_is_coverage_and_is_not_a_missing_sample(memory_store):
-    store, history = memory_store(), None
+def test_backfill_empty_success_is_coverage_and_is_not_a_missing_sample():
+    store, history = MemoryStore(), None
     history = service(store, PublicClient())
     policy = PolicyV3()
     history.snapshot(policy, NOW)
@@ -252,8 +244,8 @@ def test_backfill_empty_success_is_coverage_and_is_not_a_missing_sample(memory_s
     assert result["byPeriod"][2]["quality"]["cleaningMode"] == "SPARSE_UNCLIPPED"
 
 
-def test_public_backfill_failure_preserves_fallback_and_does_not_raise_into_live(memory_store):
-    history = service(memory_store(), PublicClient(error=RuntimeError("HTTP 429")))
+def test_public_backfill_failure_preserves_fallback_and_does_not_raise_into_live():
+    history = service(MemoryStore(), PublicClient(error=RuntimeError("HTTP 429")))
     policy = PolicyV3()
     history.snapshot(policy, NOW)
     history.process_once(NOW)
@@ -263,7 +255,7 @@ def test_public_backfill_failure_preserves_fallback_and_does_not_raise_into_live
     assert result["fallbackState"] == "LEGACY_INPUT"
 
 
-def test_hub_sends_rest_and_websocket_to_one_history_ingestor(memory_store):
+def test_hub_sends_rest_and_websocket_to_one_history_ingestor():
     class History:
         def __init__(self):
             self.calls = []
@@ -271,7 +263,7 @@ def test_hub_sends_rest_and_websocket_to_one_history_ingestor(memory_store):
         def ingest(self, trades, **kwargs):
             self.calls.append((trades, kwargs))
 
-    history, store = History(), memory_store()
+    history, store = History(), MemoryStore()
     hub = BitfinexMarketDataHub(store=store, history_service=history)
     hub.apply_rest_snapshot(trades=[trade(1)], synced_at_ms=NOW)
     hub.handle_public_message({"event": "subscribed", "chanId": 8, "channel": "trades"})
@@ -281,8 +273,8 @@ def test_hub_sends_rest_and_websocket_to_one_history_ingestor(memory_store):
     assert history.calls[1][0][0]["raw_signed_amount"] == D(-20)
 
 
-def test_published_snapshot_is_detached_from_callers(memory_store):
-    store, policy = memory_store([trade(1)]), PolicyV3()
+def test_published_snapshot_is_detached_from_callers():
+    store, policy = MemoryStore([trade(1)]), PolicyV3()
     store.record_market_coverage(NOW - HISTORY_MS, NOW)
     history = service(store)
     history.snapshot(policy, NOW)
@@ -290,6 +282,102 @@ def test_published_snapshot_is_detached_from_callers(memory_store):
     first = history.snapshot(policy, NOW)
     first["windows"]["7d"]["count"] = 999
     assert history.snapshot(policy, NOW)["windows"]["7d"]["count"] == 1
+
+
+def test_collection_status_does_not_request_full_policy_statistics(monkeypatch):
+    store, policy = MemoryStore([trade(1)]), PolicyV3()
+    store.record_market_coverage(NOW - HISTORY_MS, NOW)
+    history = service(store)
+    assert history.status(policy, NOW)["state"] == "WARMING"
+    history.snapshot(policy, NOW)
+    history.process_once(NOW, backfill=False)
+    history.retain_snapshots(set())
+
+    def reject_snapshot(*_args, **_kwargs):
+        raise AssertionError("collection status must not build a full policy snapshot")
+
+    monkeypatch.setattr(history._rolling, "snapshot", reject_snapshot)
+    history.process_once(NOW, backfill=False)
+    status = history.status(policy, NOW)
+    assert status["state"] == "READY"
+    assert status["coverage"]["complete"]
+    assert status["policyFingerprint"] == policy_fingerprint(policy)
+    assert status["priceSampleCount"] is None
+    assert "byPeriod" not in status
+    assert not history._policies and not history._published
+    assert history.status(policy, NOW + 60_001)["state"] == "STALE"
+    history._quarantine([(NOW - 1, NOW)], "test")
+    assert history.status(policy, NOW)["state"] == "DEGRADED"
+
+
+def test_research_book_sampling_respects_disconnect_generation_and_rest_fallback(tmp_path, monkeypatch):
+    minute = NOW - NOW % 60_000
+    clock = [minute + 1000]
+    monkeypatch.setattr(MarketDataStream, "_now_ms", lambda: clock[0])
+    store = LendingStateStore(tmp_path / "research.sqlite3", clock=lambda: clock[0] / 1000)
+    hub = BitfinexMarketDataHub()
+    history = service(store)
+    history.book_source = hub.book_observation
+
+    hub.handle_public_message({"event": "subscribed", "chanId": 1, "channel": "book"})
+    hub.handle_public_message([1, [[".0002", 2, 1, "-1000"]]])
+    clock[0] = minute + 2000
+    history.process_once(clock[0], backfill=False)
+    clock[0] = minute + 5000
+    history.process_once(clock[0], backfill=False)
+    first = store.book_snapshots()[0]
+    assert first["source"] == "WEBSOCKET"
+    assert first["observed_at_ms"] == minute + 2000
+
+    hub._set_connected("public", False)
+    clock[0] = minute + 61_000
+    history.process_once(clock[0], backfill=False)
+    assert len(store.book_snapshots()) == 1
+    rest_book = [{"rate": ".00025", "amount": "-800", "period": 14}]
+    hub.apply_rest_snapshot(book=rest_book, synced_at_ms=clock[0])
+    store.record_book_snapshot(rest_book, source="REST", now_ms=clock[0])
+    assert store.book_snapshots()[-1]["source"] == "REST"
+
+    class NextSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def send(self, _message):
+            pass
+
+        def recv(self, *, timeout):
+            assert hub.book_observation(clock[0]) is None
+            raise ConnectionError("before replacement snapshot")
+
+    clock[0] = minute + 121_000
+    monkeypatch.setattr(MarketDataStream, "websocket_connect", lambda *args, **kwargs: NextSession())
+    with pytest.raises(ConnectionError, match="before replacement"):
+        hub._public_session()
+    hub.handle_public_message({"event": "subscribed", "chanId": 2, "channel": "book"})
+    hub.handle_public_message([2, [".0003", 30, 1, "-700"]])
+    history.process_once(clock[0], backfill=False)
+    assert len(store.book_snapshots()) == 2
+
+    clock[0] = minute + 122_000
+    hub.handle_public_message([2, [[".0004", 120, 1, "-900"]]])
+    history.process_once(clock[0], backfill=False)
+    store.record_book_snapshot(rest_book, source="REST", now_ms=minute + 121_500)
+    recovered = store.book_snapshots()[-1]
+    assert recovered["source"] == "WEBSOCKET"
+    assert recovered["observed_at_ms"] == clock[0]
+    assert [row["period"] for row in recovered["book"]] == [120]
+
+    clock[0] = minute + 183_000
+    hub.handle_public_message({"event": "subscribed", "chanId": 3, "channel": "trades"})
+    hub.handle_public_message([3, "hb"])
+    history.process_once(clock[0], backfill=False)
+    assert len(store.book_snapshots()) == 3
+    hub.handle_public_message([2, "hb"])
+    history.process_once(clock[0], backfill=False)
+    assert store.book_snapshots()[-1]["observed_at_ms"] == clock[0]
 
 
 def test_public_read_budget_is_shared_and_nonblocking():
@@ -304,8 +392,8 @@ def test_public_read_budget_is_shared_and_nonblocking():
     assert not limiter.try_acquire()
 
 
-def test_stop_flushes_accepted_trades_without_starting_worker_or_network(memory_store):
-    store = memory_store()
+def test_stop_flushes_accepted_trades_without_starting_worker_or_network():
+    store = MemoryStore()
     client = PublicClient(error=AssertionError("shutdown must not perform network reads"))
     history = service(store, client)
     history.ingest([trade(1)], NOW)
@@ -315,8 +403,8 @@ def test_stop_flushes_accepted_trades_without_starting_worker_or_network(memory_
     assert history._thread is None
 
 
-def test_stop_reports_busy_flush_and_keeps_batch_for_a_later_retry(memory_store):
-    store = memory_store()
+def test_stop_reports_busy_flush_and_keeps_batch_for_a_later_retry():
+    store = MemoryStore()
     history = service(store)
     history.ingest([trade(1)], NOW)
     store.deferred = True
@@ -328,8 +416,8 @@ def test_stop_reports_busy_flush_and_keeps_batch_for_a_later_retry(memory_store)
     assert "1" in store.rows
 
 
-def test_websocket_burst_is_written_in_batches(memory_store):
-    store = memory_store()
+def test_websocket_burst_is_written_in_batches():
+    store = MemoryStore()
     history = service(store)
     for index in range(500):
         assert history.ingest([trade(index)], NOW)
@@ -338,9 +426,9 @@ def test_websocket_burst_is_written_in_batches(memory_store):
     assert len(store.rows) == 500
 
 
-def test_raw_parser_and_ingest_reject_nonfinite_public_values(memory_store):
+def test_raw_parser_and_ingest_reject_nonfinite_public_values():
     assert parse_funding_trades([[1, NOW, "10", "NaN", 2], [2, NOW, "Infinity", ".1", 2]]) == []
-    store, history = memory_store(), None
+    store, history = MemoryStore(), None
     history = service(store)
     history.ingest([trade(1, rate="NaN"), trade(2)], NOW)
     history.process_once(NOW, backfill=False)
@@ -348,8 +436,8 @@ def test_raw_parser_and_ingest_reject_nonfinite_public_values(memory_store):
     assert history._invalid_records == 1
 
 
-def test_policy_snapshots_remain_bound_to_their_registered_configuration(memory_store):
-    store = memory_store([trade(1)])
+def test_policy_snapshots_remain_bound_to_their_registered_configuration():
+    store = MemoryStore([trade(1)])
     store.record_market_coverage(NOW - HISTORY_MS, NOW)
     history, first = service(store), PolicyV3()
     second = replace(first, outlier_min_volume_share=D(".01"))
@@ -383,12 +471,12 @@ def test_real_sqlite_warm_start_and_external_late_insert_are_incremental():
         assert history.snapshot(policy, NOW)["byPeriod"][120]["windows"]["7d"]["volume"] == D(100)
 
 
-def test_malformed_response_never_proves_an_empty_complete_window(memory_store):
+def test_malformed_response_never_proves_an_empty_complete_window():
     class BrokenClient:
         def funding_trades(self, *_args, **_kwargs):
             return None
 
-    store, history = memory_store(), None
+    store, history = MemoryStore(), None
     history = service(store, BrokenClient())
     policy = PolicyV3()
     history.snapshot(policy, NOW)
@@ -397,16 +485,16 @@ def test_malformed_response_never_proves_an_empty_complete_window(memory_store):
     assert not history.snapshot(policy, NOW)["usable"]
 
 
-def test_snapshot_registration_alone_never_starts_worker_or_writes(memory_store):
-    store, history = memory_store(), None
+def test_snapshot_registration_alone_never_starts_worker_or_writes():
+    store, history = MemoryStore(), None
     history = service(store, PublicClient())
     history.snapshot(PolicyV3(), NOW)
     assert history._thread is None
     assert not store.upserts
 
 
-def test_policy_registry_and_published_snapshots_are_bounded_lru_caches(memory_store):
-    store, first = memory_store([trade(1)]), PolicyV3()
+def test_policy_registry_and_published_snapshots_are_bounded_lru_caches():
+    store, first = MemoryStore([trade(1)]), PolicyV3()
     history = service(store)
     policies = [replace(first, outlier_min_volume_share=D(index + 1) / D(1000)) for index in range(9)]
     for policy in policies[:8]:
@@ -538,8 +626,8 @@ def history_markers(store):
         return dict(connection.execute("SELECT key,value FROM schema_meta"))
 
 
-def test_start_persists_running_marker_before_worker_and_clean_stop_clears_it(memory_store):
-    store, history = memory_store(), None
+def test_start_persists_running_marker_before_worker_and_clean_stop_clears_it():
+    store, history = MemoryStore(), None
     history = service(store)
     observed = []
     history._run = lambda: observed.append(history_markers(store)[history.UNCLEAN_KEY])
@@ -550,8 +638,8 @@ def test_start_persists_running_marker_before_worker_and_clean_stop_clears_it(me
     assert history_markers(store)[history.UNCLEAN_KEY] == "0"
 
 
-def test_unclean_restart_quarantines_full_week_despite_preexisting_complete_coverage(memory_store):
-    store, policy = memory_store([trade("durable")]), PolicyV3()
+def test_unclean_restart_quarantines_full_week_despite_preexisting_complete_coverage():
+    store, policy = MemoryStore([trade("durable")]), PolicyV3()
     store.record_market_coverage(NOW - HISTORY_MS, NOW)
     previous = service(store)
     previous._run = lambda: None
@@ -567,9 +655,9 @@ def test_unclean_restart_quarantines_full_week_despite_preexisting_complete_cove
     assert store.market_coverage(NOW - HISTORY_MS, NOW)["complete"]
 
 
-def test_overflow_immediately_overrides_ready_and_repairs_missing_interval_first(memory_store):
+def test_overflow_immediately_overrides_ready_and_repairs_missing_interval_first():
     stamp = NOW - 100
-    store, policy = memory_store(), PolicyV3()
+    store, policy = MemoryStore(), PolicyV3()
     store.record_market_coverage(NOW - HISTORY_MS, NOW)
     client = PublicClient([["lost", stamp, "-150", ".0002", 2]])
     history = service(store, client)
@@ -589,9 +677,9 @@ def test_overflow_immediately_overrides_ready_and_repairs_missing_interval_first
     assert history_markers(store)[history.PENDING_KEY] == "[]"
 
 
-def test_quarantine_saturated_millisecond_never_restores_old_complete_proof(memory_store):
+def test_quarantine_saturated_millisecond_never_restores_old_complete_proof():
     stamp = NOW - 100
-    store, policy = memory_store(), PolicyV3()
+    store, policy = MemoryStore(), PolicyV3()
     store.record_market_coverage(NOW - HISTORY_MS, NOW)
     client = PublicClient([["a", stamp, "150", ".0002", 2], ["b", stamp, "150", ".0002", 2]])
     history = service(store, client, page_limit=2)
@@ -607,8 +695,8 @@ def test_quarantine_saturated_millisecond_never_restores_old_complete_proof(memo
     assert history_markers(store)[history.UNCLEAN_KEY] == "1"
 
 
-def test_busy_shutdown_keeps_durable_unclean_marker_for_next_process(memory_store):
-    store, policy = memory_store(), PolicyV3()
+def test_busy_shutdown_keeps_durable_unclean_marker_for_next_process():
+    store, policy = MemoryStore(), PolicyV3()
     store.record_market_coverage(NOW - HISTORY_MS, NOW)
     history = service(store)
     history._run = lambda: None
@@ -624,9 +712,9 @@ def test_busy_shutdown_keeps_durable_unclean_marker_for_next_process(memory_stor
     assert not restarted.snapshot(policy, NOW)["usable"]
 
 
-def test_full_page_repair_only_releases_quarantine_after_all_short_subpages(memory_store):
+def test_full_page_repair_only_releases_quarantine_after_all_short_subpages():
     left, right = NOW - 1000, NOW - 1
-    store, policy = memory_store(), PolicyV3()
+    store, policy = MemoryStore(), PolicyV3()
     store.record_market_coverage(NOW - HISTORY_MS, NOW)
     client = PublicClient([["a", left, "150", ".0002", 2], ["b", right, "150", ".0002", 2]])
     history = service(store, client, page_limit=2)
@@ -645,8 +733,8 @@ def test_full_page_repair_only_releases_quarantine_after_all_short_subpages(memo
     assert not history._quarantine_intervals
 
 
-def test_publish_timestamp_uses_actual_clock_and_does_not_replace_data_time(memory_store):
-    store, policy = memory_store(), PolicyV3()
+def test_publish_timestamp_uses_actual_clock_and_does_not_replace_data_time():
+    store, policy = MemoryStore(), PolicyV3()
     history = service(store)
     history.snapshot(policy, NOW)
     history.process_once(NOW - 1000, backfill=False)
@@ -680,8 +768,8 @@ def test_real_sqlite_unclean_restart_requires_fresh_rest_proof_before_reuse():
         assert history_markers(reopened)[history.UNCLEAN_KEY] == "0"
 
 
-def test_overflow_during_inflight_repair_cannot_be_cleared_by_older_rest_result(memory_store):
-    store, policy = memory_store(), PolicyV3()
+def test_overflow_during_inflight_repair_cannot_be_cleared_by_older_rest_result():
+    store, policy = MemoryStore(), PolicyV3()
     store.record_market_coverage(NOW - HISTORY_MS, NOW)
     history = service(store)
     history.snapshot(policy, NOW)
@@ -704,10 +792,10 @@ def test_overflow_during_inflight_repair_cannot_be_cleared_by_older_rest_result(
     assert [NOW - 400, NOW - 399] in result["quarantinedIntervals"]
 
 
-def test_overflow_is_closed_before_timestamp_scan_and_cannot_clear_during_registration(monkeypatch, memory_store):
+def test_overflow_is_closed_before_timestamp_scan_and_cannot_clear_during_registration(monkeypatch):
     import MarketHistory
 
-    store, policy = memory_store(), PolicyV3()
+    store, policy = MemoryStore(), PolicyV3()
     store.record_market_coverage(NOW - HISTORY_MS, NOW)
     history = service(store)
     history.snapshot(policy, NOW)
@@ -731,8 +819,8 @@ def test_overflow_is_closed_before_timestamp_scan_and_cannot_clear_during_regist
     assert not history.snapshot(policy, NOW)["usable"]
 
 
-def test_expired_quarantine_does_not_block_new_window_but_boundary_millisecond_still_does(memory_store):
-    store, policy = memory_store(), PolicyV3()
+def test_expired_quarantine_does_not_block_new_window_but_boundary_millisecond_still_does():
+    store, policy = MemoryStore(), PolicyV3()
     store.record_market_coverage(NOW - HISTORY_MS, NOW + 1)
     history = service(store)
     history.snapshot(policy, NOW)
@@ -749,9 +837,9 @@ def test_expired_quarantine_does_not_block_new_window_but_boundary_millisecond_s
     assert history_markers(store)[history.PENDING_KEY] == "[]"
 
 
-def test_repair_keeps_pagination_progress_with_moving_clock_and_public_read_limit(memory_store):
+def test_repair_keeps_pagination_progress_with_moving_clock_and_public_read_limit():
     wall_ms, monotonic = [NOW], [0.0]
-    store, policy = memory_store(), PolicyV3()
+    store, policy = MemoryStore(), PolicyV3()
     store._metadata.execute("INSERT INTO schema_meta VALUES(?,?)", (MarketHistoryService.UNCLEAN_KEY, "1"))
     call_times = []
 
@@ -789,8 +877,8 @@ def test_repair_keeps_pagination_progress_with_moving_clock_and_public_read_limi
     assert min(widths[1:3]) <= HISTORY_MS // 2
 
 
-def test_expiry_clips_queued_subpages_in_place_without_invalidating_generation(memory_store):
-    history = service(memory_store())
+def test_expiry_clips_queued_subpages_in_place_without_invalidating_generation():
+    history = service(MemoryStore())
     cutoff = NOW - HISTORY_MS
     history._quarantine([[cutoff - 10_000, cutoff + 20_000]], "REVERIFY")
     epoch = history._quarantine_epoch
@@ -804,8 +892,8 @@ def test_expiry_clips_queued_subpages_in_place_without_invalidating_generation(m
     assert history._quarantine_intervals == [[cutoff, cutoff + 20_000]]
 
 
-def test_expiry_during_rest_request_can_accept_proof_for_the_remaining_interval(memory_store):
-    store, policy = memory_store(), PolicyV3()
+def test_expiry_during_rest_request_can_accept_proof_for_the_remaining_interval():
+    store, policy = MemoryStore(), PolicyV3()
     history = service(store)
     history.snapshot(policy, NOW)
     history._quarantine([[NOW - HISTORY_MS, NOW]], "REVERIFY")
@@ -823,8 +911,8 @@ def test_expiry_during_rest_request_can_accept_proof_for_the_remaining_interval(
     assert history.snapshot(policy, NOW)["usable"]
 
 
-def test_new_gap_during_rest_request_still_invalidates_result_after_expiry(memory_store):
-    store, policy = memory_store(), PolicyV3()
+def test_new_gap_during_rest_request_still_invalidates_result_after_expiry():
+    store, policy = MemoryStore(), PolicyV3()
     history = service(store)
     history.snapshot(policy, NOW)
     history._quarantine([[NOW - HISTORY_MS, NOW]], "REVERIFY")
@@ -845,8 +933,8 @@ def test_new_gap_during_rest_request_still_invalidates_result_after_expiry(memor
     assert not history.snapshot(policy, NOW)["usable"]
 
 
-def test_default_snapshot_observes_clock_after_waiting_for_publisher_lock(memory_store):
-    store, policy, wall = memory_store(), PolicyV3(), [NOW]
+def test_default_snapshot_observes_clock_after_waiting_for_publisher_lock():
+    store, policy, wall = MemoryStore(), PolicyV3(), [NOW]
     store.record_market_coverage(NOW - HISTORY_MS, NOW)
     history = service(store)
     history.clock = lambda: wall[0] / 1000
@@ -884,8 +972,8 @@ def test_default_snapshot_observes_clock_after_waiting_for_publisher_lock(memory
     assert history.snapshot(policy, NOW)["state"] == "STALE"
 
 
-def test_warming_snapshot_default_time_is_observed_after_lock_acquisition(memory_store):
-    history, wall = service(memory_store()), [NOW]
+def test_warming_snapshot_default_time_is_observed_after_lock_acquisition():
+    history, wall = service(MemoryStore()), [NOW]
     history.clock = lambda: wall[0] / 1000
 
     class AdvancingLock:

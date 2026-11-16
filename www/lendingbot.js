@@ -41,6 +41,7 @@ const dashboardCsrf = document.querySelector('meta[name="mika-dashboard-csrf"]')
 const state = {
     config: null,
     status: null,
+    statusRequest: null,
     control: { running: false, pid: null, startedAt: null, returnCode: null, stopReason: null },
     preflight: null,
     activeDialog: null,
@@ -218,7 +219,7 @@ function formatDays(value, digits = 1) {
     return `${formatAmount(value, digits)} 天`;
 }
 
-function formatDateTime(value) {
+function formatDateTime(value, includeSeconds = false) {
     if (!value) return "--";
     const date = new Date(safeNumber(value));
     if (Number.isNaN(date.getTime())) return "--";
@@ -227,8 +228,64 @@ function formatDateTime(value) {
         day: "2-digit",
         hour: "2-digit",
         minute: "2-digit",
+        second: includeSeconds ? "2-digit" : undefined,
         hour12: false,
     });
+}
+
+function runtimeNotice(status = {}) {
+    const recovery = status.recovery || {};
+    const market = status.marketData || {};
+    const missing = [
+        market.publicConnected === false ? "公开行情" : "",
+        market.authConnected === false ? "账户行情" : "",
+    ].filter(Boolean);
+    if (recovery.active) {
+        const reason = recovery.reason || status.runtime?.safe_reason || "";
+        const account = recovery.category === "ACCOUNT_DATA" || /^ACCOUNT_/.test(reason);
+        const network = ["NETWORK_TRANSPORT", "BITFINEX_HTTP_TRANSIENT"].includes(recovery.category)
+            || (recovery.category === "MARKET_DATA" && missing.length > 0);
+        const title = recovery.manualRequired ? "等待人工处理"
+            : account ? "账户对账中" : network ? "网络恢复中" : "安全恢复中";
+        const progress = `权威快照 ${Number(recovery.successfulSnapshots || 0)}/${Math.max(2, Number(recovery.requiredSnapshots || 2))}`;
+        const retry = recovery.nextProbeAt ? ` · 下次检查 ${formatDateTime(recovery.nextProbeAt, true)}` : "";
+        const endpoints = {
+            wallets: "钱包", funding_offers: "挂单", funding_credits: "Credits", funding_loans: "Loans",
+            funding_book: "公开盘口", funding_trades: "公开成交", funding_stats: "FRR",
+        };
+        const failed = Object.hasOwn(endpoints, recovery.lastFailedEndpoint)
+            ? ` · 最近失败 ${endpoints[recovery.lastFailedEndpoint]}` : "";
+        const offerUpdate = market.offerUpdatedAt && market.offerUpdatedAt >= recovery.startedAt
+            ? "挂单已更新，正在核对账户 · " : "";
+        return {title, detail: recovery.manualRequired ? "等待确认未决操作。"
+            : `${offerUpdate}${progress}${failed}${retry} · 已尝试 ${Number(recovery.attempts || 0)} 次`};
+    }
+    if (statusMode(status) === "LIVE" && missing.length) {
+        const fallback = market.source === "REST_FALLBACK" ? "，当前使用 REST 快照" : "";
+        return {title: "网络重连中", detail: `${missing.join("、")} WebSocket 正在恢复${fallback}。`};
+    }
+    const writeRecovery = status.writeRecovery || {};
+    if (writeRecovery.canSubmit !== false) return null;
+    const blockers = Array.isArray(writeRecovery.blockers) ? writeRecovery.blockers : [];
+    const blocking = blockers.filter((item) => item.blocking !== false);
+    const offers = Array.isArray(status.openOffers) ? status.openOffers : [];
+    const protectedOrders = blocking.map((item) => {
+        if (item.kind !== "EXTERNAL_TAKEOVER" || item.state !== "CONFIRMED") return null;
+        return offers.find((offer) => String(offer.id ?? offer.offer_id) === String(item.offerId))
+            ?.manualProtection;
+    });
+    if (protectedOrders.length && protectedOrders.every((item) => item?.protected && item.protectedUntilMs)) {
+        const next = Math.min(...protectedOrders.map((item) => Number(item.protectedUntilMs)));
+        return {title: "挂单保护中",
+            detail: `${protectedOrders.length} 笔挂单仍在保护期内，最早 ${formatDateTime(next, true)} 后可接管。`};
+    }
+    if (blocking.some((item) => item.state === "AMBIGUOUS")) {
+        return {title: "交易写入对账中", detail: "正在核实提交或撤单的结果。"};
+    }
+    if (blocking.some((item) => item.kind === "DUST_CONSOLIDATION")) {
+        return {title: "小额合并处理中", detail: "正在确认撤单回款或替代挂单。"};
+    }
+    return {title: "订单对账中", detail: "正在确认挂单或处理待接管订单。"};
 }
 
 function creditAttribution(credit) {
@@ -667,41 +724,21 @@ function renderStatus() {
         : `${Array.isArray(status.openOffers) ? status.openOffers.length : 0} 笔`;
     $("chartTotal").textContent = accountValid ? formatAmount(total) : "--";
     const safeReason = status.runtime?.safe_reason;
-    const recovery = status.recovery || {};
-    const writeRecovery = status.writeRecovery || {};
-    const writeBlockers = Array.isArray(writeRecovery.blockers) ? writeRecovery.blockers : [];
-    const blockingWriteItems = writeBlockers.filter((item) => item.blocking !== false);
-    const writeBlocked = writeRecovery.canSubmit === false;
-    const recoverySyncs = Math.max(0, Number(recovery.successfulSnapshots || 0));
-    const recoveryRequired = Math.max(2, Number(recovery.requiredSnapshots || 2));
-    const nextRetrySeconds = recovery.nextProbeAt
-        ? Math.max(0, Math.ceil((Number(recovery.nextProbeAt) - Date.now()) / 1000))
-        : null;
-    const recoveryDetail = recovery.active
-        ? (recovery.manualRequired
-            ? " · 需要人工处理"
-            : ` · 权威快照 ${recoverySyncs}/${recoveryRequired}${nextRetrySeconds === null ? "" : ` · ${nextRetrySeconds}秒后重试`}`)
-        : "";
+    const notice = runtimeNotice(status);
     $("statusHeadline").textContent = stale
         ? "状态已过期，请检查实盘进程或网络。"
-        : (recovery.active
-            ? `${recovery.manualRequired ? "需要人工处理" : "自动修复中"}：${recovery.reason || safeReason || "正在重新读取权威数据"}${recoveryDetail}`
-            : (writeBlocked
-                ? `自动恢复中：${blockingWriteItems.length
-                    ? blockingWriteItems.map((item) => `${item.kind}:${item.state}`).join("，")
-                    : "等待写入对账"}`
-            : (safeReason
-                ? `PAUSED：${safeReason}`
-                : (status.last_status || "实盘状态已同步。"))));
+        : (notice ? `${notice.title} · ${notice.detail}`
+            : safeReason ? `PAUSED：${safeReason}` : (status.last_status || "实盘状态已同步。"));
     $("headerSync").textContent = status.last_update || "--";
     $("railSync").textContent = status.last_update || "--";
 
-    const version = document.querySelector('meta[name="mika-application-version"]')?.content;
-    const versionLabel = version ? `v${version}` : "版本未知";
+    const versionLabel = status.applicationVersion
+        ? `V${status.applicationVersion.split(".").slice(1, 3).join(".")}` : "V3.5";
     const badge = $("statusSchemaBadge");
-    badge.textContent = `${versionLabel} · ${!valid ? "等待实盘状态" : stale ? "状态已过期" : mode}`;
-    badge.classList.toggle("invalid", !valid || stale || Boolean(safeReason) || recovery.active || writeBlocked);
-    $("schemaState").textContent = versionLabel;
+    badge.textContent = !valid ? "等待实盘状态" : (stale ? "状态已过期" : `${versionLabel} · ${mode}`);
+    badge.classList.toggle("invalid", !valid || stale || Boolean(safeReason)
+        || Boolean(notice && notice.title !== "挂单保护中"));
+    $("schemaState").textContent = !valid ? "未同步" : (stale ? `${versionLabel} · 已过期` : `${versionLabel} · ${mode}`);
     const releaseComparison = status.releaseComparison || {};
     $("releaseBoundary").textContent = releaseComparison.activatedAtMs
         ? formatDateTime(releaseComparison.activatedAtMs)
@@ -757,18 +794,13 @@ function renderControl() {
     rail.classList.toggle("running", running);
     const mode = statusMode();
     const stale = state.status?.last_update ? statusIsStale() : false;
-    const recovery = state.status?.recovery || {};
-    const writeRecovery = state.status?.writeRecovery || {};
-    const writeBlocked = writeRecovery.canSubmit === false;
+    const notice = runtimeNotice(state.status || {});
     $("controlTitle").textContent = running
-        ? (recovery.active
-            ? (recovery.manualRequired ? "等待人工处理" : "自动修复中")
-            : (writeBlocked ? "自动恢复中" : (mode === "PAUSED" ? "PAUSED" : (stale ? "进程运行 · 状态过期" : "运行中"))))
+        ? (stale ? "进程运行 · 状态过期" : notice?.title || (mode === "PAUSED" ? "PAUSED" : "运行中"))
         : "已停止";
     $("controlDetail").textContent = running
-        ? (recovery.active
-            ? `${recovery.manualRequired ? "自动写入保持关闭。" : "正在只读同步，恢复后将在下一正常周期继续放贷。"} 已尝试 ${Number(recovery.attempts || 0)} 次。`
-            : `实盘进程 PID ${control.pid || "--"}，启动于 ${control.startedAt || "--"}。${control.managedExternally ? " 已从单实例锁恢复控制。" : ""}`)
+        ? (stale ? "正在等待实盘 Worker 发布新状态。"
+            : notice?.detail || `实盘进程 PID ${control.pid || "--"}，启动于 ${control.startedAt || "--"}。${control.managedExternally ? " 已从单实例锁恢复控制。" : ""}`)
         : "普通启动不会下单。启动实盘前必须完成只读安全预检。";
     $("primaryControlButton").textContent = running ? "停止机器人" : "启动实盘";
     $("credentialState").textContent = state.config?.credentialsConfigured ? "已配置" : "未配置";
@@ -788,8 +820,16 @@ async function loadConfig() {
 }
 
 async function loadStatus() {
-    state.status = await getJson("/api/status");
-    renderStatus();
+    if (state.statusRequest) return state.statusRequest;
+    state.statusRequest = getJson("/api/status").then((status) => {
+        state.status = status;
+        renderStatus();
+    });
+    try {
+        await state.statusRequest;
+    } finally {
+        state.statusRequest = null;
+    }
 }
 
 async function loadControl() {
@@ -901,7 +941,6 @@ function renderPreflight(data) {
         ["计划哈希", summary.planHash ? summary.planHash.slice(0, 16) : "--"],
         ["启动后先撤销", `${(summary.pendingCancellations || []).length} 笔不兼容机器人挂单`],
         ["确认后接管外部挂单", `${(summary.externalAdoptionCandidates || []).length} 笔`],
-        ["比例再平衡预计撤销", `${(summary.ratioRebalanceCancellations || []).length} 笔`],
         ["无法撤销的贷款", `${(summary.nonChangeableCredits || []).length} 笔`],
         ["账户快照", summary.accountSnapshot?.stale ? "历史快照（阻止启动）" : "实时账户"],
     ];
@@ -911,10 +950,6 @@ function renderPreflight(data) {
         (row) => `#${row.id} · ${formatAmount(row.amount)} USD · ${row.period}天 · ${row.display_type || row.offer_type || "--"}`
     );
     if (adoptionRows.length) items.push(["待接管外部挂单明细", adoptionRows.join("；")]);
-    const ratioRows = (summary.ratioRebalanceCancellations || []).map(
-        (row) => `#${row.offer_id || row.id} · ${formatAmount(row.amount)} USD · ${row.period}天`
-    );
-    if (ratioRows.length) items.push(["比例再平衡撤单明细", ratioRows.join("；")]);
     if (data.preflightId) {
         const expires = new Date(data.expiresAt);
         items.push(["本地启动确认有效至", Number.isNaN(expires.getTime()) ? data.expiresAt : `${expires.toLocaleTimeString("zh-CN", { hour12: false })}（最长 5 分钟，不是 Bitfinex API 令牌）`]);
@@ -1034,6 +1069,11 @@ window.mikaBuildReady.then((compatible) => {
     bindEvents();
     renderRoute();
     refreshAll();
-    window.setInterval(() => loadStatus().then(() => setConnection(true)).catch(() => setConnection(false)), 30000);
+    function scheduleStatusPoll() {
+        const delay = state.status?.recovery?.active ? 5000 : 30000;
+        window.setTimeout(() => loadStatus().then(() => setConnection(true)).catch(() => setConnection(false))
+            .finally(scheduleStatusPoll), delay);
+    }
+    scheduleStatusPoll();
     window.setInterval(() => loadControl().catch(() => setConnection(false)), 5000);
 });

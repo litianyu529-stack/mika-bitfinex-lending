@@ -542,7 +542,7 @@ def _period_book_rows(book, period, borrower_side=None):
     return rows
 
 
-def _build_period_selection(policy, signals, filtered_trades, book, now_ms, window_snapshot=None):
+def _build_period_selection(policy, filtered_trades, book, now_ms, window_snapshot=None):
     """Score every configured term against one global, actionable demand denominator."""
 
     configured = []
@@ -730,9 +730,7 @@ def _build_period_selection(policy, signals, filtered_trades, book, now_ms, wind
             "fillScore": pool_fill,
             "totalScore": pool_score,
             "marketQualified": market_qualified,
-            "additionalQualified": bool(
-                market_qualified and (pool != "long" or signals.get("regime") in {"rising", "spike"})
-            ),
+            "additionalQualified": market_qualified,
             "belowDemandThreshold": pool_demand < DEMAND_MIN_SHARE,
             "scores": pool_rows,
         }
@@ -872,7 +870,7 @@ def build_market_signals_v3(book, trades, stats, policy, now_ms=None, window_sna
         "completeWindowUsable": use_snapshot,
     }
     period_selection = _build_period_selection(
-        policy, result, filtered, book, now, window_snapshot if use_cached_stats else None
+        policy, filtered, book, now, window_snapshot if use_cached_stats else None
     )
     result["period_selection"] = period_selection
     result["periodSelection"] = period_selection
@@ -1037,7 +1035,8 @@ def allocate_slices_v3(
 
     validate_policy_v3(policy)
     total_principal, available = max(D("0"), D(total_principal)), max(D("0"), D(available))
-    offer_exposure = {pool: D((offer_exposure_by_pool or exposure_by_pool or {}).get(pool, 0)) for pool in POOLS}
+    open_offers = offer_exposure_by_pool if offer_exposure_by_pool is not None else exposure_by_pool or {}
+    offer_exposure = {pool: D(open_offers.get(pool, 0)) for pool in POOLS}
     period_exposure = {
         int(period): max(D("0"), D(amount)) for period, amount in (offer_exposure_by_period or {}).items()
     }
@@ -1064,7 +1063,33 @@ def allocate_slices_v3(
             for pool in POOLS
         }
     insufficient = any(bool(period_selection.get(pool, {}).get("insufficientMarketData")) for pool in POOLS)
-    target_offer_amounts, active_pools = _pool_targets_v33(offer_budget, shares, period_selection)
+    secondary_candidates = [pool for pool in POOLS[1:] if shares[pool] > 0]
+    short_first = shares["short"] > 0 and 2 * USD_ORDER_CHUNK < offer_budget < 3 * USD_ORDER_CHUNK
+    demand_selected_pool = None
+    secondary_floor_only = False
+    if short_first:
+        active_pools = ("short",)
+        target_offer_amounts = dict.fromkeys(POOLS, D("0"))
+        short_target = offer_exposure["short"] or USD_ORDER_CHUNK
+        target_offer_amounts["short"] = short_target
+        if secondary_candidates:
+            # POOLS puts medium first, so equal absolute demand favors medium.
+            demand_selected_pool = max(
+                secondary_candidates, key=lambda pool: D(period_selection.get(pool, {}).get("absoluteDemandShare") or 0)
+            )
+            active_pools += (demand_selected_pool,)
+            selection = period_selection.get(demand_selected_pool, {})
+            secondary_target = offer_budget - short_target
+            secondary_floor_only = (
+                D(selection.get("absoluteDemandShare") or 0) <= 0
+                or not selection.get("marketQualified")
+                or bool(selection.get("lowDemandConfirmed"))
+            )
+            if secondary_floor_only:
+                secondary_target = min(USD_ORDER_CHUNK, secondary_target)
+            target_offer_amounts[demand_selected_pool] = secondary_target
+    else:
+        target_offer_amounts, active_pools = _pool_targets_v33(offer_budget, shares, period_selection)
     pool_additions = {
         pool: max(D("0"), target_offer_amounts[pool] - offer_exposure[pool]) if pool in active_pools else D("0")
         for pool in POOLS
@@ -1100,11 +1125,23 @@ def allocate_slices_v3(
             "currentManagedOffers": offer_exposure[pool],
             "additionDeficit": pool_additions[pool],
         }
+    long_allocation = pool_allocation["long"]
+    remainder_excluded_pools = ()
+    if short_first:
+        remainder_excluded_pools = POOLS
+    elif long_allocation["lowDemandConfirmed"] or not long_allocation["additionalQualified"]:
+        remainder_excluded_pools = ("long",)
     diagnostics = {
         "allocation_basis": "AUTHORITATIVE_WALLET_PLUS_MANAGED_OPEN_OFFERS",
         "allocation_model": "GLOBAL_DEMAND_V1",
         "period_allocation_basis": "CUMULATIVE_DEMAND_TARGET_DEFICITS",
-        "pool_redistribution_basis": "CONFIGURED_TARGET_WITH_150_MINIMUM_AND_GLOBAL_SCORE_RELEASE",
+        "pool_redistribution_basis": (
+            "SHORT_FIRST_THEN_ABSOLUTE_DEMAND" if short_first
+            else "CONFIGURED_TARGET_WITH_150_MINIMUM_AND_GLOBAL_SCORE_RELEASE"
+        ),
+        "short_first": short_first,
+        "requires_short_confirmation": bool(short_first and not offer_exposure["short"]),
+        "remainder_excluded_pools": remainder_excluded_pools,
         "period_selection": signals.get("periodSelection") or signals.get("period_selection") or {},
         "pool_allocation": pool_allocation,
         "shares": shares,
@@ -1155,55 +1192,66 @@ def allocate_slices_v3(
             "term_allocations": {},
             **diagnostics,
         }
-    pool_maximum_counts = {
-        pool: int(pool_additions[pool] // USD_ORDER_CHUNK) if pool_additions[pool] >= USD_ORDER_CHUNK else 0
-        for pool in POOLS
-    }
-    pool_counts = _capped_weighted_counts(target_count, POOLS, pool_additions, pool_maximum_counts)
-    pool_plan_amounts = {pool: D(pool_counts[pool]) * USD_ORDER_CHUNK for pool in POOLS}
     fragmented_pool = None
-    if not any(pool_counts.values()):
-        # Cash can exceed the minimum while every pool deficit is below it.
-        # Permit one order within the existing 150 USD allocation tolerance.
-        receivers = [
-            pool for pool in active_pools
-            if pool_additions[pool] > 0
-            and pool_allocation[pool]["additionalQualified"]
-            and not pool_allocation[pool]["lowDemandConfirmed"]
-        ]
-        if receivers:
-            fragmented_pool = max(
-                receivers,
-                key=lambda pool: (pool_additions[pool], pool_allocation[pool]["compositeScore"]),
+    if short_first:
+        short_amount = pool_additions["short"]
+        pool_plan_amounts = dict.fromkeys(POOLS, D("0"))
+        pool_plan_amounts["short"] = short_amount
+        if demand_selected_pool:
+            pool_plan_amounts[demand_selected_pool] = min(
+                available - short_amount, pool_additions[demand_selected_pool],
             )
-            pool_counts[fragmented_pool] = 1
-            pool_plan_amounts[fragmented_pool] = min(
-                target_deployable, pool_additions[fragmented_pool] + USD_ORDER_CHUNK
-            ).quantize(SATOSHI, rounding=ROUND_DOWN)
-    unassigned = target_deployable - sum(pool_plan_amounts.values(), D("0"))
-    while unassigned > SATOSHI:
-        rooms = {
-            pool: max(D("0"), pool_additions[pool] - pool_plan_amounts[pool]) for pool in POOLS if pool_counts[pool] > 0
+        pool_counts = {pool: int(amount >= USD_ORDER_CHUNK) for pool, amount in pool_plan_amounts.items()}
+    else:
+        pool_maximum_counts = {
+            pool: int(pool_additions[pool] // USD_ORDER_CHUNK) if pool_additions[pool] >= USD_ORDER_CHUNK else 0
+            for pool in POOLS
         }
-        room_total = sum(rooms.values(), D("0"))
-        if room_total <= SATOSHI:
-            break
-        awarded = D("0")
-        recipients = [pool for pool in POOLS if rooms.get(pool, D("0")) > 0]
-        for pool in recipients[:-1]:
-            amount = min(
-                rooms[pool],
-                (unassigned * rooms[pool] / room_total).quantize(SATOSHI, rounding=ROUND_DOWN),
-            )
-            pool_plan_amounts[pool] += amount
+        pool_counts = _capped_weighted_counts(target_count, POOLS, pool_additions, pool_maximum_counts)
+        pool_plan_amounts = {pool: D(pool_counts[pool]) * USD_ORDER_CHUNK for pool in POOLS}
+        if not any(pool_counts.values()):
+            # Cash can exceed the minimum while every pool deficit is below it.
+            # Permit one order within the existing 150 USD allocation tolerance.
+            receivers = [
+                pool for pool in active_pools
+                if pool_additions[pool] > 0
+                and pool_allocation[pool]["additionalQualified"]
+                and not pool_allocation[pool]["lowDemandConfirmed"]
+            ]
+            if receivers:
+                fragmented_pool = max(
+                    receivers,
+                    key=lambda pool: (pool_additions[pool], pool_allocation[pool]["compositeScore"]),
+                )
+                pool_counts[fragmented_pool] = 1
+                pool_plan_amounts[fragmented_pool] = min(
+                    target_deployable, pool_additions[fragmented_pool] + USD_ORDER_CHUNK
+                ).quantize(SATOSHI, rounding=ROUND_DOWN)
+        unassigned = target_deployable - sum(pool_plan_amounts.values(), D("0"))
+        while unassigned > SATOSHI:
+            rooms = {
+                pool: max(D("0"), pool_additions[pool] - pool_plan_amounts[pool])
+                for pool in POOLS if pool_counts[pool] > 0
+            }
+            room_total = sum(rooms.values(), D("0"))
+            if room_total <= SATOSHI:
+                break
+            awarded = D("0")
+            recipients = [pool for pool in POOLS if rooms.get(pool, D("0")) > 0]
+            for pool in recipients[:-1]:
+                amount = min(
+                    rooms[pool],
+                    (unassigned * rooms[pool] / room_total).quantize(SATOSHI, rounding=ROUND_DOWN),
+                )
+                pool_plan_amounts[pool] += amount
+                awarded += amount
+            last = recipients[-1]
+            amount = min(rooms[last], unassigned - awarded)
+            pool_plan_amounts[last] += amount
             awarded += amount
-        last = recipients[-1]
-        amount = min(rooms[last], unassigned - awarded)
-        pool_plan_amounts[last] += amount
-        awarded += amount
-        if awarded <= SATOSHI:
-            break
-        unassigned -= awarded
+            if awarded <= SATOSHI:
+                break
+            unassigned -= awarded
 
     term_sequence = []
     term_diagnostics = {}
@@ -1268,6 +1316,7 @@ def allocate_slices_v3(
             "amount": order_amounts[index],
             "period": period,
             "fragmented_pool_fallback": pool == fragmented_pool,
+            "quote_at_floor": secondary_floor_only and pool == demand_selected_pool,
             "minimum_floor_order": bool(
                 pool_allocation[pool]["minimumApplied"] and offer_exposure[pool] < USD_ORDER_CHUNK
             ),
@@ -1682,6 +1731,8 @@ def build_strategy_plan_v3(
     )
     frr = D(signals.get("frr_daily_rate") or 0)
     for item in allocation["slices"]:
+        if allocation["requires_short_confirmation"] and not plan and item["pool"] != "short":
+            break
         floor_apr = policy.floor_apr(item["pool"])
         if floor_apr is None or floor_apr <= 0:
             continue
@@ -1703,7 +1754,11 @@ def build_strategy_plan_v3(
             "minimum_floor_order", False
         ):
             continue
-        target = _candidate_target_rate(item, signals, visible_floor, policy=policy)
+        quote_at_floor = item["quote_at_floor"]
+        target = (
+            ceil_rate_tick(visible_floor) if quote_at_floor
+            else _candidate_target_rate(item, signals, visible_floor, policy=policy)
+        )
         visible = []
         hidden = []
         for offer_type, submitted_rate, effective_rate, display_type in _candidate_types(policy, frr, target):
@@ -1715,10 +1770,14 @@ def build_strategy_plan_v3(
                     continue
                 fee = policy.hidden_fee_rate if is_hidden else policy.normal_fee_rate
                 floor_rate = gross_daily_floor(floor_apr, fee)
-                quick_quote = executable_quick_quote(item, signals, floor_rate, policy, fee_rate=fee)
+                quick_quote = (
+                    None if quote_at_floor else executable_quick_quote(item, signals, floor_rate, policy, fee_rate=fee)
+                )
                 candidate_target = quick_quote["targetRate"] if quick_quote else target
+                if quote_at_floor:
+                    candidate_target = ceil_rate_tick(floor_rate)
                 candidate_submitted, candidate_effective = submitted_rate, effective_rate
-                if quick_quote:
+                if candidate_target != target:
                     candidate_submitted, candidate_effective = next(
                         (submitted, effective) for kind, submitted, effective, display
                         in _candidate_types(policy, frr, candidate_target)
@@ -1734,7 +1793,9 @@ def build_strategy_plan_v3(
                     "effective_rate": candidate_effective,
                     "target_rate": candidate_target,
                     "fixed_landing_rate": (
-                        quick_quote["fixedLandingRate"] if quick_quote else competitive_rate_for_period(
+                        candidate_target if quote_at_floor
+                        else quick_quote["fixedLandingRate"] if quick_quote
+                        else competitive_rate_for_period(
                             item["layer"], item["pool"], item["period"], signals, floor_rate,
                         )
                     ),
@@ -1746,7 +1807,7 @@ def build_strategy_plan_v3(
                     "quickFallbackReason": (
                         "LEGACY_INPUT_OR_INSUFFICIENT_SAME_TERM_REFERENCE"
                         if item["layer"] == "quick" and policy.quick_pricing_mode == EXECUTABLE_QUICK_MODE
-                        and quick_quote is None else None
+                        and quick_quote is None and not quote_at_floor else None
                     ),
                 }
                 score, components, net_apr = _score_candidate(candidate, item, signals, policy, floor_apr)
@@ -1800,7 +1861,9 @@ def build_strategy_plan_v3(
                 capacity = min(capacity, max(D("0"), hidden_limit - hidden_used))
             return capacity.quantize(SATOSHI, rounding=ROUND_DOWN)
 
-        candidates = [(row, safe_capacity(row)) for row in plan]
+        candidates = [
+            (row, safe_capacity(row)) for row in plan if row["pool"] not in allocation["remainder_excluded_pools"]
+        ]
         full_capacity = [item for item in candidates if item[1] >= absorbable_remainder]
         eligible = full_capacity or [item for item in candidates if item[1] > 0]
         if eligible:

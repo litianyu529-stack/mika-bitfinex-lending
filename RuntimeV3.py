@@ -2,17 +2,27 @@ import threading
 import time
 from decimal import ROUND_DOWN
 
-from bitfinex import APP_VERSION, Bitfinex, BitfinexAmbiguousWriteError, BitfinexApiError, currency_to_symbol
+from bitfinex import (
+    APP_VERSION,
+    FUNDING_OFFER_TYPES,
+    HIDDEN_OFFER_FLAG,
+    Bitfinex,
+    BitfinexAmbiguousWriteError,
+    BitfinexApiError,
+    BitfinexTransientError,
+    currency_to_symbol,
+)
 from DomainTypes import WriteOutcome, WriteResult
 from MarketDataStream import BitfinexMarketDataHub
 from MarketHistory import MarketHistoryService
 from V36Validation import validation_status
-from Recovery import classify_runtime_error
+from Recovery import OFFER_RECOVERY_COOLDOWN_MS, classify_runtime_error, is_live_network_recovery
 from StateStore import InsufficientReservedBalance, StaleStrategyVersion
 from ExchangeModels import (
     FRR_OFFSET_OFFER_TYPES,
     extract_submitted_offer_id,
     funding_offer_effective_rate,
+    parse_account_rows,
     parse_book as parse_book_v3,
     parse_credit_rows as parse_credit_rows_v3,
     parse_funding_stats,
@@ -52,6 +62,7 @@ AUTH_FUNDING_HISTORY_LIMIT = 500
 AMBIGUOUS_HISTORY_MIN_AGE_MS = 60_000
 FUNDING_SUBMISSION_WINDOW_MS = 60_000
 MAX_FUNDING_SUBMISSIONS_PER_WINDOW = 60
+STATISTICS_REFRESH_MS = 300_000
 
 
 def order_sizing_payload():
@@ -298,14 +309,16 @@ class LendingRuntimeV3:
         on_policy_activated=None,
         clock=time.time,
         history_service=None,
+        diagnostics=None,
     ):
         self.client = client
         self.policy = validate_policy_v3(policy)
         self.store = store
         self.log = log
+        self.diagnostics = diagnostics
         self.history = history_service
         if self.history is None and hub is None and isinstance(client, Bitfinex):
-            self.history = MarketHistoryService(store, Bitfinex("", ""), clock=clock)
+            self.history = MarketHistoryService(store, Bitfinex("", "", diagnostics=diagnostics), clock=clock)
         self.hub = hub or BitfinexMarketDataHub(
             client.api_key,
             client.api_secret,
@@ -314,13 +327,19 @@ class LendingRuntimeV3:
             fallback_seconds=policy.ws_fallback_seconds,
             rest_stale_seconds=policy.rest_stale_seconds,
             history_service=self.history,
+            diagnostics=diagnostics,
         )
         if self.history is not None:
             self.hub.history_service = self.history
+            if isinstance(self.hub, BitfinexMarketDataHub):
+                self.history.book_source = self.hub.book_observation
         self.auto_transfer_wallets = tuple(str(item).lower() for item in auto_transfer_wallets)
         self.on_policy_activated = on_policy_activated
         self.clock = clock
         self._last_rest_sync_ms = 0
+        self._last_offer_recovery_ms = None
+        self._last_seen_offer_update_ms = None
+        self._recovery_probe_failure = None
         self._last_history_sync_ms = 0
         self._stats = []
         self._bootstrapped = False
@@ -328,18 +347,26 @@ class LendingRuntimeV3:
         self._income_sync_thread = None
         self._pending_cancel_requested = set()
         self._last_dust_check_bucket = None
+        self._statistics = None
+        self._history_snapshots_requested = set()
         self._history_status = {"state": "UNAVAILABLE", "usable": False}
         self._validation_status = {"approved": False, "reasons": ["V3.5 mode"]}
 
     def _market_signals(self, snapshot, policy, now_ms=None):
-        window = None if self.history is None else self.history.snapshot(policy, now_ms)
+        self._validation_status = validation_status(self.store, policy)
+        requested = policy.quick_pricing_mode == EXECUTABLE_QUICK_MODE
+        enabled = requested and self._validation_status["approved"]
+        window = None
+        if self.history is not None:
+            if enabled:
+                window = self.history.snapshot(policy, now_ms)
+                self._history_snapshots_requested.add(window["policyFingerprint"])
+            else:
+                window = self.history.status(policy, now_ms)
         # LIVE observes the window after REST and after copying the published
         # snapshot. A cycle-start timestamp can predate that snapshot. Explicit
         # times remain authoritative for deterministic callers and replay.
         now = int(now_ms if now_ms is not None else self.clock() * 1000)
-        self._validation_status = validation_status(self.store, policy)
-        requested = policy.quick_pricing_mode == EXECUTABLE_QUICK_MODE
-        enabled = requested and self._validation_status["approved"]
         signals = build_market_signals_v3(
             snapshot["book"], snapshot["trades"], self._stats, policy, now,
             window_snapshot=window if enabled else None,
@@ -493,14 +520,18 @@ class LendingRuntimeV3:
                 policy_v3_with_overrides(StrategyPolicyV3(), self.store.strategy("ACTIVE")["policy"])
             )
         self._apply_policy_runtime_settings()
-        self.sync_rest(include_history=True)
+        episode = self.store.recovery_status()
+        if not episode["active"] or episode["manualRequired"] or self.store.recovery_probe_due():
+            self.sync_rest(include_history=True)
         auto_resolved = self.store.reconcile_ambiguous_candidates()
         if auto_resolved:
             self._log(f"已通过唯一 Bitfinex 记录自动恢复 {len(auto_resolved)} 个未知写入。")
         if start_websocket:
             self.hub.start()
         if self.history is not None:
-            self.history.snapshot(self.policy)
+            if (self.policy.quick_pricing_mode == EXECUTABLE_QUICK_MODE
+                    and validation_status(self.store, self.policy)["approved"]):
+                self.history.snapshot(self.policy)
             self.history.start()
         self.start_income_history_sync()
         self._bootstrapped = True
@@ -605,6 +636,8 @@ class LendingRuntimeV3:
 
     def sync_rest(self, include_history=False, now_ms=None):
         now = int(now_ms if now_ms is not None else self.clock() * 1000)
+        episode = self.store.recovery_status()
+        network_recovery = episode["active"] and is_live_network_recovery(episode["category"], episode["targetMode"])
         symbol = currency_to_symbol("USD")
         raw_book = self.client.funding_book(symbol, 250)
         book_observed_at_ms = int(self.clock() * 1000)
@@ -614,15 +647,27 @@ class LendingRuntimeV3:
         # five-minute/hour signals.  Fetch newest-first; the parser restores
         # chronological order for signal construction.
         trade_read_due = self.history is None or self.history.public_read_limiter.try_acquire()
-        raw_trades = (
-            self.client.funding_trades(symbol, start=now - 7 * 86_400_000, end=now, limit=10000, sort=-1)
-            if trade_read_due else []
-        )
+        raw_trades = []
+        trade_failure = None
+        trade_generation = None
+        if trade_read_due:
+            try:
+                raw_trades = self.client.funding_trades(symbol, start=now - 7 * 86_400_000,
+                                                        end=now, limit=10000, sort=-1)
+            except BitfinexTransientError as exc:
+                if (exc.status_code == 429 or not self._bootstrapped or include_history or episode["active"]
+                        or not isinstance(self.hub, BitfinexMarketDataHub)):
+                    raise
+                trade_generation = self.hub.fresh_public_trade_generation(int(self.clock() * 1000))
+                if trade_generation is None:
+                    raise
+                trade_failure = exc
         raw_stats = self.client.funding_stats(symbol, start=now - 7 * 86_400_000, end=now, limit=250)
-        raw_wallets = self.client.wallets()
-        if self.auto_transfer_wallets and self.store.runtime()["mode"] == "LIVE":
+        raw_wallets, account_snapshot = self._read_rest_account(symbol)
+        if (not episode["active"] and trade_failure is None and self.auto_transfer_wallets
+                and self.store.runtime()["mode"] == "LIVE"):
             transferred = False
-            for wallet in parse_wallet_rows_v3(raw_wallets):
+            for wallet in account_snapshot["wallets"]:
                 if (
                     wallet["wallet_type"] not in self.auto_transfer_wallets
                     or wallet.get("available") is None
@@ -649,19 +694,19 @@ class LendingRuntimeV3:
                 else:
                     self._log(f"USD 自动转入被明确拒绝：{result.error}")
             if transferred:
-                raw_wallets = self.client.wallets()
-        raw_offers = self.client.active_funding_offers(symbol)
-        raw_credits = self.client.active_funding_credits(symbol)
-        try:
-            raw_loans = self.client.active_funding_loans(symbol)
-        except AttributeError:
-            raw_loans = []
+                raw_wallets, account_snapshot = self._read_rest_account(symbol)
+        if trade_failure is not None:
+            # Only trades have a live WebSocket feed that can replace this
+            # optional historical read. Book, FRR and private reads are required.
+            current_generation = self.hub.fresh_public_trade_generation(int(self.clock() * 1000))
+            if current_generation != trade_generation or self.store.recovery_status()["active"]:
+                raise trade_failure
+            if self.diagnostics is not None:
+                self.diagnostics.trade_rest_fallback(trade_failure)
         book = parse_book_v3(raw_book)
         trades = parse_funding_trades(raw_trades)
         self._stats = parse_funding_stats(raw_stats)
-        offers = parse_offer_rows_v3(raw_offers)
-        credits = parse_credit_rows_v3(raw_credits)
-        loans = parse_loan_rows_v3(raw_loans)
+        offers, credits, loans = (account_snapshot[key] for key in ("offers", "credits", "loans"))
         active_lending = _active_lending_rows(credits, loans)
         previously_managed = {int(row["offer_id"]) for row in self.store.offers(active_only=True) if row["managed"]}
         managed_ids = {int(row["offer_id"]) for row in self.store.offers() if row["managed"]}
@@ -669,14 +714,6 @@ class LendingRuntimeV3:
             offer["managed"] = offer["id"] in managed_ids
             offer["pool"] = pool_for_period(offer["period"])
             offer["display_type"] = self._offer_display_type(offer)
-        authoritative_account = self._account(
-            {
-                "wallets": parse_wallet_rows_v3(raw_wallets),
-                "offers": offers,
-                "credits": credits,
-                "loans": loans,
-            }
-        )
         active_offer_ids = {int(row["id"]) for row in offers}
         known_credit_ids = {int(row["credit_id"]) for row in self.store.credits()}
         if (previously_managed - active_offer_ids) and any(
@@ -705,10 +742,7 @@ class LendingRuntimeV3:
                 protection = self.store.manual_protection_for_offer(offer, now)
                 if offer["managed"] and not (protection and protection["needsTakeover"]):
                     self.store.discard_unconfirmed_external_takeover(offer["id"])
-        takeover_snapshot_safe = (
-            authoritative_account["walletAvailableKnown"] and authoritative_account["reconciliationStatus"] == "MATCHED"
-        )
-        if self.policy.adopt_external_offers and takeover_snapshot_safe:
+        if self.policy.adopt_external_offers:
             self._close_absent_external_takeover_observations(active_offer_ids, now)
             active_strategy = self.store.strategy("ACTIVE")
             strategy_version = active_strategy["version_id"] if active_strategy else "3"
@@ -732,8 +766,6 @@ class LendingRuntimeV3:
                     if int(offer["id"]) in adopted_ids:
                         offer["managed"] = True
                 self.store.reconcile_offers(offers, now)
-        elif self.policy.adopt_external_offers:
-            self.store.reset_unconfirmed_external_takeovers()
         for takeover in self.store.external_takeovers(states={"CANCELLING"}):
             if int(takeover["offer_id"]) not in active_offer_ids:
                 self.store.update_external_takeover(takeover["offer_id"], "CLOSED", now_ms=now)
@@ -764,7 +796,7 @@ class LendingRuntimeV3:
         self._last_rest_sync_ms = now
         ambiguous = self.store.intents(states={"AMBIGUOUS"})
         history_complete = self.sync_ambiguous_write_history(ambiguous, now) if ambiguous else True
-        if include_history or now - self._last_history_sync_ms >= 900_000:
+        if include_history or (not network_recovery and now - self._last_history_sync_ms >= 900_000):
             self.sync_history(now)
         # Reconcile write uncertainty only after the complete account snapshot is
         # stored. A unique match is safe even if history was temporarily
@@ -796,7 +828,8 @@ class LendingRuntimeV3:
                     credit["layer"] = stored.get("layer")
                     credit["display_type"] = stored.get("display_type") or credit.get("display_type")
             self.hub.apply_rest_snapshot(offers=offers, credits=credits, loans=loans, synced_at_ms=now)
-        snapshot = self.hub.snapshot(now)
+        completed_at = int(self.clock() * 1000) if now_ms is None else now
+        snapshot = self.hub.snapshot(completed_at)
         account = self._account(snapshot)
         current = self.store.runtime()
         if current["mode"] == "PAUSED" and str(current.get("safe_reason") or "").startswith("AMBIGUOUS_CANCEL:"):
@@ -814,8 +847,14 @@ class LendingRuntimeV3:
             self._reconcile_ambiguous_dust_consolidation(active_offer_ids, now)
             # Transient data/transport/runtime failures recover after two complete
             # snapshots. Manual ambiguous submits are handled only above.
-            self.store.record_consistent_sync(now)
-        elif self.store.recovery_status()["active"]:
+            result = (self.store.record_recovery_snapshot(
+                completed_at, expected_started_at=episode["startedAt"], probe_started_at=now,
+            ) if episode["active"] else None)
+            if result is None and not self.store.recovery_status()["active"]:
+                self.store.record_consistent_sync(completed_at)
+            if result and result["resumed"] and self.diagnostics is not None:
+                self.diagnostics.worker_recovered(episode["startedAt"], episode["attempts"], completed_at)
+        elif episode["active"]:
             reason = (
                 "MARKET_DATA_STALE"
                 if snapshot.get("safeRequired")
@@ -823,7 +862,10 @@ class LendingRuntimeV3:
                 if not account["walletAvailableKnown"]
                 else "ACCOUNT_RECONCILIATION_MISMATCH"
             )
-            self.store.record_recovery_failure(reason, now_ms=now)
+            self.store.record_recovery_failure(
+                reason, "MARKET_DATA" if snapshot.get("safeRequired") else "ACCOUNT_DATA", completed_at,
+                expected_started_at=episode["startedAt"],
+            )
         elif current["mode"] == "LIVE":
             reason = (
                 "ACCOUNT_AVAILABLE_BALANCE_UNKNOWN"
@@ -832,6 +874,26 @@ class LendingRuntimeV3:
             )
             self.store.enter_protected_pause(reason)
         return snapshot
+
+    def _read_rest_account(self, symbol):
+        raw_wallets = self.client.wallets()
+        load_loans = getattr(self.client, "active_funding_loans", None)
+        snapshot = {
+            "wallets": parse_account_rows(raw_wallets, parse_wallet_rows_v3, "wallets"),
+            "offers": parse_account_rows(
+                self.client.active_funding_offers(symbol), parse_offer_rows_v3, "funding_offers",
+            ),
+            "credits": parse_account_rows(
+                self.client.active_funding_credits(symbol), parse_credit_rows_v3, "funding_credits",
+            ),
+            "loans": parse_account_rows(load_loans(symbol) if load_loans else [], parse_loan_rows_v3, "funding_loans"),
+        }
+        account = self._account(snapshot)
+        if account["reconciliationStatus"] != "MATCHED":
+            reason = ("ACCOUNT_RECONCILIATION_MISMATCH" if account["walletAvailableKnown"]
+                      else "ACCOUNT_AVAILABLE_BALANCE_UNKNOWN")
+            raise BitfinexApiError(reason, category="ACCOUNT_DATA")
+        return raw_wallets, snapshot
 
     def sync_ambiguous_write_history(self, intents, now_ms=None):
         """Fetch the narrow authoritative history window for uncertain submits.
@@ -847,39 +909,28 @@ class LendingRuntimeV3:
             start = request_ms - 300_000
             end = min(now, request_ms + 600_000)
             try:
-                funding_rows = (
-                    self.client.funding_trades_history(
-                        symbol,
-                        start=start,
-                        end=end,
-                        limit=AUTH_FUNDING_HISTORY_LIMIT,
-                        sort=1,
-                    )
-                    or []
+                funding_rows = self.client.funding_trades_history(
+                    symbol, start=start, end=end, limit=AUTH_FUNDING_HISTORY_LIMIT, sort=1,
                 )
+                parsed = parse_account_rows(funding_rows, parse_funding_trade_rows_v3, "funding_trades_history")
             except (BitfinexApiError, AttributeError) as exc:
                 complete = False
                 self._log(f"未知挂单 Funding Trades 对账失败，将保持 PAUSED 并重试：{exc}")
             else:
-                self._store_funding_trade_history(parse_funding_trade_rows_v3(funding_rows))
+                self._store_funding_trade_history(parsed)
                 if len(funding_rows) >= AUTH_FUNDING_HISTORY_LIMIT:
                     complete = False
                     self._log("未知挂单 Funding Trades 达到 500 条上限，无法证明历史窗口完整。")
             try:
-                offer_rows = (
-                    self.client.funding_offers_history(
-                        symbol,
-                        start=start,
-                        end=end,
-                        limit=AUTH_FUNDING_HISTORY_LIMIT,
-                    )
-                    or []
+                offer_rows = self.client.funding_offers_history(
+                    symbol, start=start, end=end, limit=AUTH_FUNDING_HISTORY_LIMIT,
                 )
+                parsed = parse_account_rows(offer_rows, parse_offer_rows_v3, "funding_offers_history")
             except (BitfinexApiError, AttributeError) as exc:
                 complete = False
                 self._log(f"未知挂单 Funding Offers 对账失败，将保持 PAUSED 并重试：{exc}")
             else:
-                self.store.upsert_offer_history(parse_offer_rows_v3(offer_rows))
+                self.store.upsert_offer_history(parsed)
                 if len(offer_rows) >= AUTH_FUNDING_HISTORY_LIMIT:
                     complete = False
                     self._log("未知挂单 Funding Offers 达到 500 条上限，无法证明历史窗口完整。")
@@ -1311,6 +1362,12 @@ class LendingRuntimeV3:
             )
         return json_decimal(rows)
 
+    def _statistics_snapshot(self, now_ms):
+        last = self._statistics["all"]["calculatedAtMs"] if self._statistics is not None else None
+        if last is None or not 0 <= now_ms - last < STATISTICS_REFRESH_MS:
+            self._statistics = self.store.statistics_windows(now_ms=now_ms)
+        return self._statistics
+
     def _strategy_status(self, snapshot, signals, result=None):
         account = self._account(snapshot)
         runtime = self.store.runtime()
@@ -1350,6 +1407,11 @@ class LendingRuntimeV3:
                 {"automatic": bool(self.policy.adopt_external_offers), "offers": self.store.external_takeovers()}
             )
             strategy_payload["periodActivity"] = json_decimal(self.store.period_activity(now - 86_400_000, "USD"))
+        recovery = self.store.recovery_status()
+        if self._recovery_probe_failure:
+            started_at, last_probe_at, endpoint = self._recovery_probe_failure
+            if recovery["active"] and (recovery["startedAt"], recovery["lastProbeAt"]) == (started_at, last_probe_at):
+                recovery["lastFailedEndpoint"] = endpoint
         status = {
             "schemaVersion": 3,
             "stateSchemaVersion": 19,
@@ -1358,7 +1420,7 @@ class LendingRuntimeV3:
             "v36Validation": json_decimal(self._validation_status),
             "operationMode": runtime["mode"],
             "runtime": runtime,
-            "recovery": self.store.recovery_status(),
+            "recovery": recovery,
             "marketData": {
                 key: value
                 for key, value in snapshot.items()
@@ -1377,13 +1439,7 @@ class LendingRuntimeV3:
             "activeStrategy": self.store.strategy("ACTIVE"),
             "draftStrategy": self.store.strategy("DRAFT"),
             "pendingStrategy": self.store.strategy("PENDING"),
-            "statistics": {
-                "1d": self.store.statistics(1),
-                "7d": self.store.statistics(7),
-                "30d": self.store.statistics(30),
-                "90d": self.store.statistics(90),
-                "all": self.store.statistics(None),
-            },
+            "statistics": self._statistics_snapshot(now),
         }
         if self.log is not None:
             for key, value in status.items():
@@ -1394,7 +1450,7 @@ class LendingRuntimeV3:
             if runtime["mode"] == "PAUSED" and runtime.get("safe_reason"):
                 self.log.refreshStatus(f"PAUSED：{runtime.get('safe_reason') or '策略已暂停'}")
             else:
-                self.log.refreshStatus(f"v{APP_VERSION} {runtime['mode']} 状态已同步。")
+                self.log.refreshStatus(f"V3.6 {runtime['mode']} 状态已同步。")
         return status
 
     def _submit_plan(
@@ -1414,8 +1470,11 @@ class LendingRuntimeV3:
         attempt_budget = max(0, MAX_FUNDING_SUBMISSIONS_PER_WINDOW - recent_attempts)
         attempts = 0
         plan_hash = str(plan_result.get("plan_hash") or "unhashed")
+        short_pending = plan_result.get("requires_short_confirmation", False)
         for row in plan_result["plan"]:
             if attempts >= attempt_budget:
+                break
+            if short_pending and row["pool"] != "short":
                 break
             base_slice_key = f"{strategy_version}:{plan_hash}:{row['pool']}:{row['layer']}:{row['slice_index']}"
             submit_row = dict(row)
@@ -1495,6 +1554,7 @@ class LendingRuntimeV3:
                             )
                 remaining -= submit_row["amount"]
                 submitted.append({"intentId": intent["id"], "offerId": offer_id, **submit_row})
+                short_pending = False
             elif result.outcome == WriteOutcome.UNKNOWN:
                 self.store.mark_ambiguous(intent["id"], result.error)
                 break
@@ -1520,6 +1580,7 @@ class LendingRuntimeV3:
         cap_limited_available=None,
         *,
         frr_daily_rate=None,
+        remainder_excluded_pools=(),
     ):
         """Restore canceled offers before new wallet cash is allocated."""
 
@@ -1548,6 +1609,7 @@ class LendingRuntimeV3:
                     == "LIMIT"
                     and str(row.get("source_offer_type") or "LIMIT").upper() == "LIMIT"
                     and not (int(row.get("source_flags") or 0) & 64)
+                    and row["pool"] not in remainder_excluded_pools
                 ),
                 None,
             )
@@ -1992,7 +2054,59 @@ class LendingRuntimeV3:
             canceled.append(offer_id)
         return canceled
 
-    def _dust_consolidation(self, account, signals, now_ms, strategy_version):
+    def _dust_replacement_terms(self, offer, account, signals, additional_amount):
+        offer_type = str(offer.get("offer_type") or "LIMIT").upper()
+        submitted_rate = D(offer["rate"])
+        if offer_type == "FRR":
+            offer_type, submitted_rate = "FRRDELTAVAR", D("0")
+        if offer_type not in FUNDING_OFFER_TYPES or not submitted_rate.is_finite() or submitted_rate < 0:
+            return None
+        display = self._offer_display_type({"offer_type": offer_type, "rate": submitted_rate})
+        flags = int(offer.get("flags") or 0)
+        hidden = bool(flags & HIDDEN_OFFER_FLAG)
+        period = int(offer["period"])
+        pool = str(offer.get("pool") or pool_for_period(period))
+        if (not self._display_type_enabled(self.policy, display)
+                or flags & ~HIDDEN_OFFER_FLAG or (hidden and not self.policy.enable_hidden)
+                or pool not in POOLS or period not in self.policy.periods(pool)):
+            return None
+        floor_apr = self.policy.floor_apr(pool)
+        if floor_apr is None:
+            return None
+        fee = self.policy.hidden_fee_rate if hidden else self.policy.normal_fee_rate
+        floor_rate = ceil_rate_tick(gross_daily_floor(floor_apr, fee))
+        # An FRR replacement submits the original offset against today's FRR.
+        # A previously reported effective rate cannot price the replacement.
+        effective = funding_offer_effective_rate(
+            {"offer_type": offer_type, "rate": submitted_rate}, signals.get("frr_daily_rate"),
+        )
+        if effective is None or rate_below_floor(effective, floor_rate):
+            return None
+        exposure = account.get("existingExposure", {})
+        principal = D(account.get("total", 0))
+        if (offer_type == "FRRDELTAVAR"
+                and D(exposure.get("variable", 0)) + additional_amount
+                > principal * self.policy.variable_max_share / D("100")):
+            return None
+        if (hidden and D(exposure.get("hidden", 0)) + additional_amount
+                > principal * D(self.policy.hidden_max_share or 0) / D("100")):
+            return None
+        return {
+            "pool": pool,
+            "layer": str(offer.get("layer") or "balanced"),
+            "period": period,
+            "offer_type": offer_type,
+            "display_type": display,
+            "flags": flags,
+            "submitted_rate": submitted_rate,
+            "effective_rate": effective,
+            "target_rate": effective,
+            "gross_daily_floor": floor_rate,
+        }
+
+    def _dust_consolidation(
+        self, account, signals, now_ms, strategy_version, *, cap_limited_available=None, remainder_excluded_pools=(),
+    ):
         """Merge wallet dust without changing the selected offer's strategy identity."""
 
         status = self.store.consolidation_status()
@@ -2070,10 +2184,15 @@ class LendingRuntimeV3:
             if expected_remaining == 0:
                 self.store.clear_consolidation(now_ms)
                 return {"blocking": True, "state": "CONFIRMED", "canceled": [], "submitted": []}
+            if deployed > 0 and expected_remaining < USD_ORDER_CHUNK:
+                self.store.clear_consolidation(now_ms)
+                return {"blocking": True, "state": "CONFIRMED", "canceled": [], "submitted": []}
+            if wallet < expected_remaining and account.get("reconciliationStatus") == "MATCHED":
+                # A fill can reduce the remaining principal between the last snapshot and cancellation.
+                self.store.clear_consolidation(now_ms)
+                self._log("小额合并回款低于原计划，剩余余额交回正常分配。")
+                return {"blocking": True, "state": "IDLE", "canceled": [], "submitted": []}
             if wallet < expected_remaining or expected_remaining < USD_ORDER_CHUNK:
-                if deployed > 0 and expected_remaining < USD_ORDER_CHUNK:
-                    self.store.clear_consolidation(now_ms)
-                    return {"blocking": True, "state": "CONFIRMED", "canceled": [], "submitted": []}
                 self.store.update_consolidation("READY", now_ms=now_ms)
                 return {"blocking": True, "state": "READY", "canceled": [], "submitted": []}
 
@@ -2104,13 +2223,11 @@ class LendingRuntimeV3:
                 self.store.enter_protected_pause(f"DUST_CHAIN_MISSING:{status['offer_id']}")
                 return {"blocking": True, "state": "AMBIGUOUS", "canceled": [], "submitted": []}
 
-            pool = str(source_offer.get("pool") or pool_for_period(source_offer["period"]))
-            layer = str(source_offer.get("layer") or "balanced")
-            hidden = bool(int(source_offer.get("flags") or 0) & 64)
-            fee = self.policy.hidden_fee_rate if hidden else self.policy.normal_fee_rate
-            floor_rate = ceil_rate_tick(gross_daily_floor(self.policy.floor_apr(pool), fee))
-            submitted_rate = D(source_offer["rate"])
-            effective_rate = D(source_offer.get("rate_real") or source_offer["rate"])
+            terms = self._dust_replacement_terms(source_offer, account, signals, expected_remaining)
+            if terms is None or (cap_limited_available is not None and D(cap_limited_available) < expected_remaining):
+                self.store.clear_consolidation(now_ms)
+                self._log("小额合并重挂条件已变化，剩余余额交回正常分配。")
+                return {"blocking": True, "state": "IDLE", "canceled": [], "submitted": []}
             slice_count = int(expected_remaining // USD_ORDER_CHUNK)
             amounts = evenly_distributed_amounts(expected_remaining, slice_count)
             slice_offset = len(related)
@@ -2119,21 +2236,8 @@ class LendingRuntimeV3:
                 "plan": [
                     {
                         "slice_index": slice_offset + index,
-                        "pool": pool,
-                        "layer": layer,
+                        **terms,
                         "amount": amount,
-                        "period": int(source_offer["period"]),
-                        "offer_type": str(source_offer.get("offer_type") or "LIMIT"),
-                        "display_type": str(
-                            source_offer.get("display_type")
-                            or source_offer.get("offer_type")
-                            or "LIMIT"
-                        ),
-                        "flags": int(source_offer.get("flags") or 0),
-                        "submitted_rate": submitted_rate,
-                        "effective_rate": effective_rate,
-                        "target_rate": effective_rate,
-                        "gross_daily_floor": floor_rate,
                         "plan_hash": dust_hash,
                         "pricing_curve_version": source_chain.get("pricing_curve_version"),
                         "fixed_landing_rate": source_chain.get("fixed_landing_rate"),
@@ -2166,6 +2270,8 @@ class LendingRuntimeV3:
         self._last_dust_check_bucket = bucket
         if wallet < DUST_REINVEST_MINIMUM or wallet >= USD_ORDER_CHUNK:
             return {"blocking": False, "state": "IDLE", "canceled": [], "submitted": []}
+        if cap_limited_available is not None and D(cap_limited_available) < wallet:
+            return {"blocking": False, "state": "NO_CANDIDATE", "canceled": [], "submitted": []}
         if self.store.reprice_count_since(now_ms - 3_600_000) >= self.policy.max_reprices_per_hour:
             return {"blocking": False, "state": "RATE_LIMITED", "canceled": [], "submitted": []}
         candidates = []
@@ -2173,7 +2279,6 @@ class LendingRuntimeV3:
         for offer in active_offers.values():
             if (protections.get(int(offer["offer_id"])) or {}).get("needsTakeover"):
                 continue
-            display = str(offer.get("display_type") or offer.get("offer_type") or "LIMIT").upper()
             age = now_ms - int(offer.get("mts_created") or now_ms)
             amount = D(offer["amount"])
             pool = str(offer.get("pool") or pool_for_period(offer["period"]))
@@ -2185,12 +2290,14 @@ class LendingRuntimeV3:
             )
             if (
                 offer.get("managed")
-                and display == "LIMIT"
+                and offer["currency"] == "USD"
+                and pool not in remainder_excluded_pools
                 and int(offer["offer_id"]) not in self._pending_cancel_requested
                 and not (self.store.reprice_chain_for_offer(int(offer["offer_id"])) or {}).get("pending_action")
                 and not cooling_down
                 and age >= self.policy.minimum_offer_minutes * 60_000
                 and amount + wallet >= USD_ORDER_CHUNK
+                and self._dust_replacement_terms(offer, account, signals, wallet) is not None
             ):
                 candidates.append(offer)
         if not candidates:
@@ -2207,7 +2314,9 @@ class LendingRuntimeV3:
             ),
         )
         offer_id = int(candidate["offer_id"])
-        source_chain = self.store.ensure_reprice_chain(candidate, strategy_version, now_ms)
+        source_chain = self.store.ensure_reprice_chain(
+            candidate, strategy_version, now_ms, frr_daily_rate=signals.get("frr_daily_rate"),
+        )
         if source_chain is None or source_chain.get("pending_action"):
             return {"blocking": False, "state": "NO_CHAIN", "canceled": [], "submitted": []}
         if not self._manual_cancel_allowed(candidate, now_ms):
@@ -2419,6 +2528,48 @@ class LendingRuntimeV3:
             "plan": pending_result,
         }
 
+    def wait_for_next_cycle(self, normal_seconds, *, resumed=False):
+        recovery = self.store.recovery_status()
+        if not recovery["active"]:
+            time.sleep(1 if resumed else normal_seconds)
+            return
+
+        # Publish paused status and heartbeat at least every 30 seconds, even
+        # when the next exchange request is farther away.
+        status_at_ms = int(self.clock() * 1000) + 30_000
+        offer_event = self.hub.offer_update_event if isinstance(self.hub, BitfinexMarketDataHub) else None
+        while recovery["active"]:
+            now_ms = int(self.clock() * 1000)
+            wake_at_ms = status_at_ms
+            if not recovery["manualRequired"]:
+                wake_at_ms = min(wake_at_ms, recovery["nextProbeAt"] or now_ms)
+            if now_ms >= wake_at_ms:
+                return
+            delay = (wake_at_ms - now_ms) / 1000
+            if offer_event is None:
+                time.sleep(delay)
+            elif offer_event.wait(delay):
+                offer_event.clear()
+                if self._expedite_for_offer_update(recovery, int(self.clock() * 1000)):
+                    return
+            recovery = self.store.recovery_status()
+
+    def _expedite_for_offer_update(self, recovery, now_ms):
+        updated = self.hub.offer_updated_at_ms()
+        if updated is None or updated == self._last_seen_offer_update_ms:
+            return False
+        self._last_seen_offer_update_ms = updated
+        if (not is_live_network_recovery(recovery["category"], recovery["targetMode"])
+                or updated <= (recovery["lastProbeAt"] or 0)
+                or not 0 <= now_ms - updated < OFFER_RECOVERY_COOLDOWN_MS
+                or (self._last_offer_recovery_ms is not None
+                    and now_ms - self._last_offer_recovery_ms < OFFER_RECOVERY_COOLDOWN_MS)):
+            return False
+        if self.store.expedite_network_probe(recovery["startedAt"], updated, now_ms):
+            self._last_offer_recovery_ms = now_ms
+            return True
+        return False
+
     def cycle(self, now_ms=None):
         now = int(now_ms if now_ms is not None else self.clock() * 1000)
         self.store.touch_heartbeat(now)
@@ -2430,31 +2581,40 @@ class LendingRuntimeV3:
             rest_due = self.store.recovery_probe_due(now)
         if rest_due:
             try:
-                snapshot = self.sync_rest(now_ms=now)
+                snapshot = self.sync_rest(now_ms=now_ms)
             except BitfinexApiError as exc:
                 decision = classify_runtime_error(exc)
                 if not decision.retryable:
                     raise
                 runtime = self.store.runtime()
-                recovery = self.store.recovery_status()
-                origin = recovery.get("targetMode") or runtime["mode"]
-                if runtime["mode"] != "PAUSED":
-                    self.store.set_mode("PAUSED", f"AUTO_RECOVERY:{decision.category}")
-                self.store.begin_recovery(
-                    decision.category,
-                    str(exc),
-                    origin_mode=origin,
-                    target_mode=origin,
+                completed_at = int(self.clock() * 1000) if now_ms is None else now
+                episode = recovery if recovery["active"] else self.store.begin_recovery(
+                    decision.category, str(exc), origin_mode="LIVE", target_mode="LIVE",
+                    now_ms=completed_at, pause_live=True,
                 )
-                self.store.record_recovery_failure(str(exc), decision.category, now)
-                snapshot = self.hub.snapshot(now)
+                if episode["active"]:
+                    failure = self.store.record_recovery_failure(
+                        exc, decision.category, completed_at, expected_started_at=episode["startedAt"],
+                    )
+                    endpoint = getattr(exc, "rest_request", {}).get("endpoint")
+                    if (endpoint and (failure["startedAt"], failure["lastProbeAt"])
+                            == (episode["startedAt"], completed_at)):
+                        self._recovery_probe_failure = (episode["startedAt"], completed_at, endpoint)
+                if self.diagnostics is not None:
+                    self.diagnostics.worker_rest_failure(
+                        exc, decision.category, previous_mode=runtime["mode"], recovering=recovery["active"],
+                    )
+                snapshot = self.hub.snapshot(completed_at)
                 self._log(f"v3 REST 同步失败：{exc}")
+            if recovery["active"] and self.diagnostics is not None:
+                finished = int(self.clock() * 1000) if now_ms is None else now
+                self.diagnostics.worker_recovery_probe(recovery, self.store.recovery_status(), now, finished)
         else:
             snapshot = self.hub.snapshot(now)
         if now_ms is None:
             now = int(self.clock() * 1000)
             snapshot = self.hub.snapshot(now)
-        if snapshot["safeRequired"]:
+        if snapshot["safeRequired"] and self.store.runtime()["mode"] == "LIVE":
             self.store.enter_protected_pause("MARKET_DATA_STALE")
         for offer in snapshot.get("offers", []):
             self.store.observe_manual_offer(offer, now)
@@ -2468,6 +2628,7 @@ class LendingRuntimeV3:
             )
             self.store.enter_protected_pause(reason)
         signals_policy = self.policy
+        self._history_snapshots_requested.clear()
         signals = self._market_signals(snapshot, signals_policy, None if now_ms is None else now)
         self.store.record_market_bars(signals.get("windows"), now)
         self._record_variable_floor_violations(now)
@@ -2479,11 +2640,13 @@ class LendingRuntimeV3:
                 snapshot, account, signals, now, refresh_market_clock=now_ms is None
             )
             if pending_status and pending_status.get("pending"):
+                pending = self.store.strategy("PENDING")
+                pending_policy = validate_policy_v3(
+                    policy_v3_with_overrides(StrategyPolicyV3(), pending["policy"]),
+                    require_live_floors=True,
+                )
                 signals = pending_status.get("signals") or signals
-                result = pending_status.pop("plan", None)
-                if result is None:
-                    active = self.store.strategy("ACTIVE")
-                    result = self._build_plan(account, self.policy, signals, active["version_id"] if active else "3")
+                result = self._build_plan(account, pending_policy, signals, pending["version_id"])
                 result["pendingStrategy"] = pending_status
                 result["submitted"] = []
                 canceled = pending_status.get("canceled", [])
@@ -2505,11 +2668,15 @@ class LendingRuntimeV3:
                         signals = self._market_signals(snapshot, self.policy, None if now_ms is None else now)
                 self._persist_period_selection(signals, version, now)
                 result = self._build_plan(account, self.policy, signals, version)
+                remainder_excluded_pools = result.get("remainder_excluded_pools", ())
                 canceled = self._cancel_external_takeovers(now, version, result.get("plan_hash"))
                 dust = {"blocking": False, "canceled": [], "submitted": [], "state": "IDLE"}
                 hard_adjustments = []
                 if not canceled:
-                    dust = self._dust_consolidation(account, signals, now, version)
+                    dust = self._dust_consolidation(
+                        account, signals, now, version, cap_limited_available=result.get("cap_limited_available"),
+                        remainder_excluded_pools=remainder_excluded_pools,
+                    )
                     canceled = dust.get("canceled", [])
                     result["dustConsolidation"] = dust
                 if not canceled and not dust.get("blocking"):
@@ -2536,10 +2703,14 @@ class LendingRuntimeV3:
                             version,
                             result.get("cap_limited_available"),
                             frr_daily_rate=signals.get("frr_daily_rate"),
+                            remainder_excluded_pools=remainder_excluded_pools,
                         )
-                        result["submitted"] = replacement_submitted + self._submit_plan(
-                            result, new_cash_available, version
-                        )
+                        result["submitted"] = replacement_submitted
+                        # Wait for a fresh snapshot if replacements used or reserved any of this wallet.
+                        if not result.get("short_first") or (
+                            new_cash_available == account["wallet"] and self.store.runtime()["mode"] == "LIVE"
+                        ):
+                            result["submitted"] += self._submit_plan(result, new_cash_available, version)
                 elif dust.get("blocking"):
                     result["submitted"] = dust.get("submitted", [])
                 else:
@@ -2557,9 +2728,14 @@ class LendingRuntimeV3:
             if resume_barrier:
                 result["recoveryResumeBarrier"] = True
                 result["submitted"] = []
-        self.store.record_account_sample(
-            account["total"], account["wallet"], account["offers"], account["credits"], self._net_interest_total(), now
-        )
+        if (account["reconciliationStatus"] == "MATCHED" and not snapshot["safeRequired"]
+                and not self.store.recovery_status()["active"]):
+            self.store.record_account_sample(
+                account["total"], account["wallet"], account["offers"], account["credits"],
+                self._net_interest_total(), now,
+            )
+        if self.history is not None:
+            self.history.retain_snapshots(self._history_snapshots_requested)
         status = self._strategy_status(snapshot, signals, result)
         if self.log is not None:
             self.log.persistStatus()

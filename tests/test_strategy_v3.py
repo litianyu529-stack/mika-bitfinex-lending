@@ -302,6 +302,118 @@ def test_small_balance_respects_minimum_and_pool_caps(available, expected_count,
         assert result["empty_reason"] in {"BELOW_MINIMUM", "CONCENTRATION_CAP_OR_MINIMUM"}
 
 
+def small_budget_market(medium_demand, long_demand, *, market_qualified=True, low_demand=False):
+    return signals(periodSelection={"byPool": {
+        "short": selection_row((2,), 2, ("1",)),
+        "medium": {
+            **selection_row((14,), 14, ("1",)),
+            "absoluteDemandShare": D(medium_demand),
+        },
+        "long": {
+            **selection_row((120,), 120, ("0.01",), qualified=market_qualified),
+            "absoluteDemandShare": D(long_demand),
+            "lowDemandConfirmed": low_demand,
+        },
+    }})
+
+
+@pytest.mark.parametrize(
+    "budget, medium_demand, long_demand, expected",
+    [
+        ("300", "0.1", "0.8", [("short", "150"), ("medium", "150")]),
+        ("300.00000001", "0.1", "0.8", [("short", "150"), ("long", "150.00000001")]),
+        ("400", "0.8", "0.1", [("short", "150"), ("medium", "250")]),
+        ("400", "0.4", "0.4", [("short", "150"), ("medium", "250")]),
+        ("449.99", "0.1", "0.8", [("short", "150"), ("long", "299.99")]),
+        ("450", "0.1", "0.8", [("short", "150"), ("medium", "150"), ("long", "150")]),
+    ],
+)
+def test_small_budget_reserves_short_and_compares_absolute_demand(budget, medium_demand, long_demand, expected):
+    result = build_strategy_plan_v3(
+        D("1000"), D(budget), {}, limit_policy(), small_budget_market(medium_demand, long_demand)
+    )
+
+    assert [(row["pool"], row["amount"]) for row in result["plan"]] == [
+        (pool, D(amount)) for pool, amount in expected
+    ]
+    assert result["idle_amount"] == 0
+
+
+@pytest.mark.parametrize(
+    "medium_demand, long_demand, market_qualified, low_demand, winner",
+    [
+        ("0", "0", True, False, "medium"),
+        ("0.01", "0.04", True, True, "long"),
+        ("0.10", "0.80", False, False, "long"),
+    ],
+)
+def test_small_budget_secondary_minimum_quotes_at_floor_and_leaves_remainder(
+    medium_demand, long_demand, market_qualified, low_demand, winner,
+):
+    configured = limit_policy()
+    market = small_budget_market(
+        medium_demand, long_demand, market_qualified=market_qualified, low_demand=low_demand,
+    )
+    result = build_strategy_plan_v3(D("1000"), D("400"), {}, configured, market)
+
+    assert [(row["pool"], row["amount"]) for row in result["plan"]] == [("short", D("150")), (winner, D("150"))]
+    assert result["plan"][1]["submitted_rate"] == ceil_rate_tick(
+        gross_daily_floor(configured.floor_apr(winner), configured.normal_fee_rate)
+    )
+    assert result["idle_amount"] == D("100")
+
+
+@pytest.mark.parametrize(
+    "wallet, open_offers, low_demand, expected, idle",
+    [
+        ("240", {"short": "160"}, False, [("long", "240")], "0"),
+        ("230", {"short": "20", "long": "150"}, False, [("long", "230")], "0"),
+        ("230", {"medium": "150"}, False, [("short", "150")], "80"),
+        ("150", {"short": "150", "long": "50"}, True, [], "150"),
+        ("400", {}, False, [("short", "150"), ("long", "250")], "0"),
+    ],
+)
+def test_small_budget_counts_only_managed_open_offers(wallet, open_offers, low_demand, expected, idle):
+    result = build_strategy_plan_v3(
+        D("1000"), D(wallet), {"short": D("600")}, limit_policy(),
+        small_budget_market("0.01", "0.04", low_demand=low_demand),
+        offer_exposure_by_pool=open_offers,
+    )
+
+    assert [(row["pool"], row["amount"]) for row in result["plan"]] == [
+        (pool, D(amount)) for pool, amount in expected
+    ]
+    assert result["idle_amount"] == D(idle)
+    assert result["requires_short_confirmation"] == ("short" not in open_offers)
+
+
+@pytest.mark.parametrize(
+    "shares, expected",
+    [
+        (("0", "50", "50"), ["medium", "long"]),
+        (("50", "50", "0"), ["short", "medium"]),
+        (("50", "0", "50"), ["short", "long"]),
+        (("100", "0", "0"), ["short"]),
+    ],
+)
+def test_small_budget_respects_disabled_pools(shares, expected):
+    short, medium, long = map(D, shares)
+    configured = limit_policy(short_share=short, medium_share=medium, long_share=long)
+    result = build_strategy_plan_v3(D("1000"), D("400"), {}, configured, small_budget_market("0.1", "0.8"))
+
+    assert [row["pool"] for row in result["plan"]] == expected
+
+
+def test_small_budget_skips_secondary_if_short_cannot_be_quoted():
+    result = build_strategy_plan_v3(
+        D("1000"), D("400"), {}, limit_policy(short_floor_apr=None), small_budget_market("0.1", "0.8"),
+    )
+
+    assert [row["pool"] for row in result["slices"]] == ["short", "long"]
+    assert result["plan"] == []
+    assert result["idle_amount"] == D("400")
+
+
 def test_fragmented_pool_deficits_use_one_order_within_allocation_tolerance():
     available = D("240.12179174")
     result = build_strategy_plan_v3(
@@ -384,7 +496,7 @@ def test_plan_absorbs_the_exact_live_remainder_into_an_existing_safe_order(tmp_p
         limit_policy(),
         signals(),
         "live-remainder",
-        offer_exposure_by_pool={"short": D("0"), "medium": D("0"), "long": D("150")},
+        offer_exposure_by_pool={"short": D("0"), "medium": D("0"), "long": D("300")},
     )
 
     assert len(result["plan"]) == 1
@@ -447,6 +559,7 @@ def test_remainder_absorption_prefers_the_highest_scoring_planned_pool(monkeypat
         limit_policy(),
         signals(periodSelection=selection),
         "scored-remainder",
+        offer_exposure_by_pool={"long": D("150")},
     )
     amounts = {row["pool"]: row["amount"] for row in result["plan"]}
 
@@ -816,6 +929,18 @@ def test_new_balanced_offer_q75_guard_never_weakens_floor():
     assert target == D("0.0002088")
 
 
+def test_ratio_overweight_converges_without_canceling_existing_offers():
+    configured = limit_policy(short_share=D("60"), medium_share=D("30"), long_share=D("10"))
+    result = build_strategy_plan_v3(
+        D("1300"), D("450"), {}, configured, signals(),
+        existing_exposure={"total": D("850")}, offer_exposure_by_pool={"short": D("850")},
+    )
+    assert result["deviation_amounts"]["short"] > 0
+    assert result["plan"]
+    assert all(row["pool"] != "short" for row in result["plan"])
+    assert result["rebalanceCancellations"] == []
+
+
 def test_net_apr_floors_and_fee_difference_are_enforced():
     normal = gross_daily_floor(D("0.05"), D("0.15"))
     hidden = gross_daily_floor(D("0.05"), D("0.18"))
@@ -1127,6 +1252,35 @@ def test_unsupported_long_floor_keeps_only_the_150_dollar_minimum():
     assert all(row["effective_rate"] >= gross_daily_floor(D("1"), D("0.15")) for row in long_rows)
     assert result["planned_amount"] == D("10000.00000000")
     assert result["idle_amount"] == D("0")
+
+
+@pytest.mark.parametrize("recent_rate, regime", [("0.0005", "neutral"), ("0.0003", "low")])
+def test_long_demand_can_receive_additional_funds_outside_rising_markets(recent_rate, regime):
+    now = 1_900_000_000_000
+    configured = limit_policy()
+    periods = (2, 14, 120)
+    book = [{"period": period, "rate": D(recent_rate), "amount": D("-1000")} for period in periods]
+    trades = [
+        {"period": period, "mts": now - age, "rate": D(rate), "amount": D("100")}
+        for period in periods
+        for age, rate in ((60_000, recent_rate), (600_000, "0.0005"), (900_000, "0.0005"))
+    ]
+    market = build_market_signals_v3(book, trades, [], configured, now)
+    result = build_strategy_plan_v3(D("1500"), D("1500"), {}, configured, market)
+
+    assert market["regime"] == regime
+    assert market["periodSelection"]["byPool"]["long"]["additionalQualified"] is True
+    assert sum(row["amount"] for row in result["plan"] if row["pool"] == "long") == D("225")
+
+
+def test_low_demand_long_order_does_not_absorb_remainder_outside_small_budget_band():
+    configured = limit_policy(short_share=D("0"), medium_share=D("0"), long_share=D("100"))
+    market = small_budget_market("0.9", "0.04", low_demand=True)
+    result = build_strategy_plan_v3(D("1000"), D("299.99"), {}, configured, market)
+
+    assert [(row["pool"], row["amount"]) for row in result["plan"]] == [("long", D("150"))]
+    assert result["idle_amount"] == D("149.99")
+    assert result["remainder_excluded_pools"] == ("long",)
 
 
 def test_all_offer_types_are_generated_and_plain_frr_is_zero_variable_delta():
@@ -2810,7 +2964,8 @@ def test_pending_stage_target_is_used_for_replacement_submission(tmp_path):
     assert rebound["started_at_ms"] == offer["mts_created"]
 
 
-def test_visible_limit_reprice_absorbs_sub_150_surplus_and_preserves_chain(tmp_path):
+@pytest.mark.parametrize("remainder_excluded_pools", [(), ("long",)])
+def test_visible_limit_reprice_preserves_chain_and_respects_remainder_exclusions(tmp_path, remainder_excluded_pools):
     now = 1_900_000_000_000
     store = LendingStateStore(tmp_path / "reprice-remainder.sqlite3", clock=lambda: now / 1000)
     offer = {
@@ -2873,13 +3028,15 @@ def test_visible_limit_reprice_absorbs_sub_150_surplus_and_preserves_chain(tmp_p
         D("150.41832433"),
         "v3",
         D("150.41832433"),
+        remainder_excluded_pools=remainder_excluded_pools,
     )
     rebound = store.reprice_chain_for_offer(911)
 
-    assert client.amount == D("150.41832433")
-    assert submitted[0]["absorbed_remainder"] == D("0.41832433")
-    assert submitted[0]["remainder_absorption_pool"] == "long"
-    assert available == 0
+    absorbed = D("0") if remainder_excluded_pools else D("0.41832433")
+    assert client.amount == D("150") + absorbed
+    assert submitted[0]["absorbed_remainder"] == absorbed
+    assert submitted[0]["remainder_absorption_pool"] == ("long" if absorbed else None)
+    assert available == D("0.41832433") - absorbed
     assert rebound["current_stage"] == 3
     assert rebound["started_at_ms"] == chain["started_at_ms"]
     assert D(rebound["market_anchor_rate"]) == D("0.00035")
@@ -3804,12 +3961,21 @@ def test_low_demand_confirmation_requires_two_distinct_cycles_and_resets(tmp_pat
     assert reset["cycles"] == 0 and reset["confirmed"] is False
 
 
-def _managed_short_offer(store, offer_id, amount, period, now_ms):
+def _managed_short_offer(store, offer_id, amount, period, now_ms, *,
+                         offer_type="LIMIT", display_type="LIMIT", rate="0.0004", rate_real=None, flags=0):
+    effective_rate = D(rate_real or rate)
+    pool = pool_for_period(period)
     order = {
         **intent_order(amount=str(amount)),
         "slice_key": f"managed-short:{offer_id}",
+        "pool": pool,
         "period": int(period),
         "strategy_version": "v3.3",
+        "offer_type": offer_type,
+        "display_type": display_type,
+        "submitted_rate": D(rate),
+        "effective_rate": effective_rate,
+        "flags": flags,
     }
     _, intent = store.reserve_intent(order, D("1000"))
     store.confirm_intent(intent["id"], offer_id)
@@ -3818,15 +3984,15 @@ def _managed_short_offer(store, offer_id, amount, period, now_ms):
         "currency": "USD",
         "amount": D(str(amount)),
         "amount_original": D(str(amount)),
-        "rate": D("0.0004"),
-        "rate_real": D("0.0004"),
+        "rate": D(rate),
+        "rate_real": D(rate_real) if rate_real is not None else None,
         "period": int(period),
-        "offer_type": "LIMIT",
-        "display_type": "LIMIT",
-        "flags": 0,
+        "offer_type": offer_type,
+        "display_type": display_type,
+        "flags": flags,
         "status": "ACTIVE",
         "managed": True,
-        "pool": "short",
+        "pool": pool,
         "layer": "balanced",
         "mts_created": now_ms - 20 * 60_000,
     }
@@ -3839,7 +4005,7 @@ def _managed_short_offer(store, offer_id, amount, period, now_ms):
                     "amount": D(row["amount"]),
                     "amount_original": D(row["amount_original"]),
                     "rate": D(row["rate"]),
-                    "rate_real": D(row["rate_real"] or row["rate"]),
+                    "rate_real": D(row["rate_real"]) if row["rate_real"] is not None else None,
                     "period": int(row["period"]),
                     "offer_type": row["offer_type"],
                     "display_type": row["display_type"],
@@ -3946,9 +4112,6 @@ def test_dust_reinvestment_prioritizes_short_then_medium_then_long(tmp_path):
     _managed_short_offer(store, 7121, "190", 2, now)
     _managed_short_offer(store, 7122, "160", 30, now)
     _managed_short_offer(store, 7123, "150", 120, now)
-    with store.transaction(immediate=True) as connection:
-        connection.execute("UPDATE offers SET pool='medium' WHERE offer_id=7122")
-        connection.execute("UPDATE offers SET pool='long' WHERE offer_id=7123")
 
     class Client:
         api_key = ""
@@ -3975,12 +4138,122 @@ def test_dust_reinvestment_prioritizes_short_then_medium_then_long(tmp_path):
     assert client.canceled == [7121]
 
 
-def test_dust_reinvestment_can_consolidate_a_long_offer_when_no_short_candidate(tmp_path):
+@pytest.mark.parametrize(
+    ("offer_type", "display_type", "rate", "flags"),
+    [
+        ("FRRDELTAFIX", "FRR_DELTA_FIXED", "0", 0),
+        ("FRRDELTAVAR", "FRR_DELTA_VARIABLE", "0.00002", 0),
+        ("FRRDELTAVAR", "FRR", "0", 0),
+        ("LIMIT", "LIMIT", "0.0004", 64),
+    ],
+)
+def test_dust_reinvestment_preserves_supported_offer_terms(tmp_path, offer_type, display_type, rate, flags):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "dust-types.sqlite3", clock=lambda: now / 1000)
+    source = D("171.57366611")
+    dust = D("2.91994530")
+    _managed_short_offer(
+        store, 7101, source, 2, now, offer_type=offer_type, display_type=display_type, rate=rate, flags=flags,
+    )
+
+    class Client:
+        def __init__(self):
+            self.canceled = []
+            self.submitted = []
+
+        def cancel_funding_offer(self, offer_id):
+            self.canceled.append(offer_id)
+            return [0, "SUCCESS"]
+
+        def submit_funding_offer(self, symbol, amount, submitted_rate, period, submitted_type, flags=0):
+            self.submitted.append((symbol, D(amount), D(submitted_rate), period, submitted_type, flags))
+            return [0, "on-req", None, None, [7102]]
+
+    client = Client()
+    configured = policy(enable_hidden=True, hidden_max_share=D("10"))
+    runtime = LendingRuntimeV3(client, configured, store, hub=object(), clock=lambda: now / 1000)
+    account = {
+        "wallet": dust, "total": D("2000"), "reconciliationStatus": "MATCHED",
+        "existingExposure": {"variable": source if offer_type == "FRRDELTAVAR" else D("0"),
+                             "hidden": source if flags else D("0")},
+    }
+    started = runtime._dust_consolidation(account, signals(), now, "v3.3", cap_limited_available=dust)
+    assert started["state"] == "CANCELLING"
+    assert client.canceled == [7101]
+    original_chain = store.reprice_chain_for_offer(7101)
+    store.reconcile_offers([], now + 30_000)
+    restored_account = {**account, "wallet": source + dust, "existingExposure": {}}
+    fresh_market = signals(frr_daily_rate=D("0.00029"))
+    assert runtime._dust_consolidation(restored_account, fresh_market, now + 30_000, "v3.3")["state"] == "READY"
+    result = runtime._dust_consolidation(
+        restored_account, fresh_market, now + 60_000, "v3.3", cap_limited_available=source + dust,
+    )
+    assert client.submitted == [("fUSD", D("174.49361141"), D(rate), 2, offer_type, flags)]
+    replacement = result["submitted"][0]
+    assert replacement["display_type"] == display_type
+    assert replacement["effective_rate"] == (D(rate) if offer_type == "LIMIT" else D("0.00029") + D(rate))
+    assert store.reprice_chain_for_offer(7102)["started_at_ms"] == original_chain["started_at_ms"]
+
+
+@pytest.mark.parametrize("changed", ["frr_floor", "funding_cap", "partial_fill"])
+def test_dust_reinvestment_rechecks_replacement_after_cancellation(tmp_path, changed):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "dust-floor.sqlite3", clock=lambda: now / 1000)
+    _managed_short_offer(
+        store, 7101, "170", 2, now, offer_type="FRRDELTAFIX", display_type="FRR_DELTA_FIXED",
+        rate="0", rate_real="0.0004",
+    )
+
+    class Client:
+        def cancel_funding_offer(self, _offer_id):
+            return [0, "SUCCESS"]
+
+        def submit_funding_offer(self, *_args, **_kwargs):
+            pytest.fail("invalid replacement must not reach Bitfinex")
+
+    runtime = LendingRuntimeV3(Client(), policy(), store, hub=object(), clock=lambda: now / 1000)
+    account = {"wallet": D("3"), "reconciliationStatus": "MATCHED"}
+    assert runtime._dust_consolidation(account, signals(), now, "v3.3")["state"] == "CANCELLING"
+    store.reconcile_offers([], now + 30_000)
+    restored = {**account, "wallet": D("173")}
+    assert runtime._dust_consolidation(restored, signals(), now + 30_000, "v3.3")["state"] == "READY"
+    if changed == "partial_fill":
+        restored["wallet"] = D("151")
+    market = signals(frr_daily_rate=D("0.00001")) if changed == "frr_floor" else signals()
+    budget = D("170") if changed == "funding_cap" else restored["wallet"]
+    assert runtime._dust_consolidation(
+        restored, market, now + 60_000, "v3.3", cap_limited_available=budget,
+    )["state"] == "IDLE"
+    assert store.consolidation_status()["state"] == "IDLE"
+
+
+@pytest.mark.parametrize("constraint", ["funding_cap", "variable_cap", "missing_frr", "disabled_type"])
+def test_dust_reinvestment_skips_unreplaceable_frr_offer(tmp_path, constraint):
+    now = 1_900_000_000_000
+    store = LendingStateStore(tmp_path / "dust-constraints.sqlite3", clock=lambda: now / 1000)
+    _managed_short_offer(
+        store, 7101, "170", 2, now, offer_type="FRRDELTAVAR", display_type="FRR",
+        rate="0", rate_real="0.0004",
+    )
+    configured = policy(enable_frr=constraint != "disabled_type")
+    runtime = LendingRuntimeV3(object(), configured, store, hub=object(), clock=lambda: now / 1000)
+    account = {
+        "wallet": D("3"), "reconciliationStatus": "MATCHED",
+        "total": D("1700" if constraint == "variable_cap" else "2000"),
+        "existingExposure": {"variable": D("170")},
+    }
+    market = signals(frr_daily_rate=None) if constraint == "missing_frr" else signals()
+    budget = D("2") if constraint == "funding_cap" else D("3")
+    result = runtime._dust_consolidation(account, market, now, "v3.3", cap_limited_available=budget)
+    assert result["state"] == "NO_CANDIDATE"
+    assert store.consolidation_status()["state"] == "IDLE"
+
+
+@pytest.mark.parametrize("remainder_excluded_pools", [(), ("long",), ("short", "medium", "long")])
+def test_dust_reinvestment_respects_remainder_exclusions(tmp_path, remainder_excluded_pools):
     now = 1_900_000_000_000
     store = LendingStateStore(tmp_path / "long-candidate.sqlite3", clock=lambda: now / 1000)
-    _managed_short_offer(store, 7150, "150", 2, now)
-    with store.transaction(immediate=True) as connection:
-        connection.execute("UPDATE offers SET pool='long', period=120 WHERE offer_id=7150")
+    _managed_short_offer(store, 7150, "150", 120, now)
     source = next(row for row in store.offers() if row["offer_id"] == 7150)
     source_chain = store.ensure_reprice_chain(source, "v3.3", now)
     store.complete_reprice_stage(source_chain["chain_key"], 3, now - 1, market_anchor_rate=D("0.00035"))
@@ -4008,9 +4281,14 @@ def test_dust_reinvestment_can_consolidate_a_long_offer_when_no_short_candidate(
     )
 
     result = runtime._dust_consolidation(
-        {"wallet": D("3.16089453"), "reconciliationStatus": "MATCHED"}, market, now, "v3.3"
+        {"wallet": D("3.16089453"), "reconciliationStatus": "MATCHED"}, market, now, "v3.3",
+        remainder_excluded_pools=remainder_excluded_pools,
     )
 
+    if remainder_excluded_pools:
+        assert result["state"] == "NO_CANDIDATE"
+        assert client.canceled == []
+        return
     assert result["state"] == "CANCELLING"
     assert client.canceled == [7150]
 

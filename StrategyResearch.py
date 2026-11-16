@@ -34,7 +34,7 @@ from StrategyV3 import (
     json_decimal,
     validate_policy_v3,
 )
-from bitfinex import BitfinexApiError
+from bitfinex import BitfinexApiError, BitfinexTransientError
 
 
 D = Decimal
@@ -57,19 +57,21 @@ class PublicRateLimiter:
 
 
 def _public_read(action, limiter, retry_sleeper, max_attempts=5):
-    """Retry only rate-limited public reads; authenticated writes never use this path."""
+    """Retry public research reads through the same request limiter."""
     for attempt in range(int(max_attempts)):
         limiter.wait()
         try:
-            return action()
+            response = action()
+            if isinstance(response, dict) and response.get("error") == "ERR_RATE_LIMIT":
+                raise BitfinexTransientError("Bitfinex public API rate limit", status_code=429)
+            return response
         except BitfinexApiError as exc:
-            message = str(exc).lower()
-            if "http 429" not in message and "ratelimit" not in message:
-                raise
-            if attempt + 1 >= int(max_attempts):
+            message = str(exc).lower().replace("_", "")
+            rate_limited = exc.status_code == 429 or "http 429" in message or "ratelimit" in message
+            if (not exc.retryable and not rate_limited) or attempt + 1 >= int(max_attempts):
                 raise
             interval = float(getattr(limiter, "minimum_interval", 4.1))
-            retry_sleeper(min(120.0, max(30.0, interval * 4) * (2**attempt)))
+            retry_sleeper(min(120.0, max(60.0 if rate_limited else 5.0, interval * 4) * (2**attempt)))
 
 
 def _coverage(rows):
@@ -114,25 +116,47 @@ def backfill_public_market_data(
             if right <= left:
                 continue
             raw = _public_read(lambda: fetch(left, right - 1, page_limit), limiter, retry_sleeper)
+            if not isinstance(raw, list):
+                raise BitfinexApiError("Unexpected public history response; coverage not verified")
             parsed = parse(raw)
             pages += 1
             valid = [row for row in parsed if left <= int(row["mts"]) < right]
-            persist(valid)
-            malformed = len(parsed) != len(raw or ()) or len(valid) != len(parsed)
+            malformed = len(raw) > page_limit or len(parsed) != len(raw) or len(valid) != len(parsed)
+            if certify and not malformed:
+                timestamps = [int(row[1]) for row in raw]
+                malformed = (
+                    len({row["id"] for row in valid}) != len(valid)
+                    or any(earlier > later for earlier, later in zip(timestamps, timestamps[1:]))
+                )
             if malformed:
                 reason = "INVALID_OR_OUT_OF_INTERVAL_RESPONSE"
-            elif len(raw or ()) < page_limit:
+            elif len(raw) < page_limit:
+                persist(valid)
                 complete_ranges.append({"startMs": left, "endMs": right})
                 if certify:
                     store.record_market_coverage(left, right, status="COMPLETE", source="RESEARCH_REST")
                 continue
             elif right - left > 1:
-                midpoint = (left + right) // 2
+                if certify:
+                    # Trades are requested in ascending time order. A full
+                    # page proves all earlier milliseconds; query the final
+                    # timestamp again so tied IDs can never be skipped.
+                    boundary = max(row["mts"] for row in valid)
+                    if boundary > left:
+                        persist([row for row in valid if row["mts"] < boundary])
+                        store.record_market_coverage(left, boundary, status="COMPLETE", source="RESEARCH_REST")
+                        jobs.append((boundary, right))
+                        continue
+                    midpoint = left + 1
+                else:
+                    midpoint = (left + right) // 2
                 jobs.append((midpoint, right))
                 jobs.append((left, midpoint))
                 continue
             else:
                 reason = "SATURATED_SINGLE_MILLISECOND"
+            if not malformed:
+                persist(valid)
             unresolved_ranges.append({"startMs": left, "endMs": right, "reason": reason})
             if certify:
                 store.record_market_coverage(left, right, status="UNRESOLVED", source="RESEARCH_REST",
@@ -197,68 +221,6 @@ def _safe_variant(base, **changes):
     if any(getattr(policy, name) != getattr(base, name) for name in hard_fields):
         raise ValueError("research variant changed a hard safety boundary")
     return policy
-
-
-def research_variants(active_policy):
-    """Versioned variants limited to term pools, layers, order types, and repricing."""
-    return {
-        "current_v3": active_policy,
-        "frr_only": _safe_variant(
-            active_policy,
-            enable_limit=False,
-            enable_frr=True,
-            enable_frr_delta_fixed=False,
-            enable_frr_delta_variable=False,
-            enable_hidden=False,
-        ),
-        "limit_near_fill": _safe_variant(
-            active_policy,
-            enable_limit=True,
-            enable_frr=False,
-            enable_frr_delta_fixed=False,
-            enable_frr_delta_variable=False,
-            enable_hidden=False,
-            quick_share=D("60"),
-            balanced_share=D("30"),
-            high_share=D("10"),
-        ),
-        "candidate_short_cycle": _safe_variant(
-            active_policy,
-            quick_share=D("55"),
-            balanced_share=D("35"),
-            high_share=D("10"),
-            minimum_offer_minutes=max(5, active_policy.minimum_offer_minutes),
-        ),
-        "candidate_term_capture": _safe_variant(
-            active_policy,
-            short_share=D("40"),
-            medium_share=D("35"),
-            long_share=D("25"),
-            balanced_share=D("45"),
-            high_share=D("25"),
-            quick_share=D("30"),
-            reprice_cooldown_minutes=max(15, active_policy.reprice_cooldown_minutes),
-        ),
-    }
-
-
-def paired_bootstrap_interval(candidate, baseline, iterations=2000, seed=307):
-    paired = [D(left) - D(right) for left, right in zip(candidate, baseline)]
-    if not paired:
-        return {"lower": D("0"), "median": D("0"), "upper": D("0"), "samples": 0}
-    randomizer = random.Random(seed)
-    means = []
-    for _ in range(int(iterations)):
-        draw = [paired[randomizer.randrange(len(paired))] for _ in paired]
-        means.append(sum(draw, D("0")) / D(len(draw)))
-    means.sort()
-    last = len(means) - 1
-    return {
-        "lower": means[int(last * 0.025)],
-        "median": means[int(last * 0.5)],
-        "upper": means[int(last * 0.975)],
-        "samples": len(paired),
-    }
 
 
 def paired_moving_block_interval(candidate, baseline, iterations=2000, seed=307, block_days=3):

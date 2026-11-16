@@ -4,6 +4,7 @@ import os
 import sqlite3
 import threading
 import time
+from bisect import bisect_left
 from collections import defaultdict
 from contextlib import contextmanager
 from decimal import Decimal
@@ -11,8 +12,10 @@ from decimal import Decimal
 from WriteRecovery import can_clear_ambiguous_pause, restart_transition, unique_unbound_candidate
 from ExchangeModels import funding_offer_effective_rate
 from Recovery import (
+    NETWORK_RECOVERY_MINIMUM_GAP_MS,
     RECOVERY_MINIMUM_GAP_MS,
     RECOVERY_REQUIRED_SNAPSHOTS,
+    is_live_network_recovery,
     recovery_category_for_reason,
     recovery_delay_seconds,
 )
@@ -37,6 +40,9 @@ CURRENT_RELEASE = "0.3.6.0"
 CURRENT_RELEASE_LABEL = "V3.6"
 CURRENT_SCHEMA_VERSION = 19
 SCHEMA_FAMILY = "v3"
+STATISTICS_WINDOWS = {"1d": 1, "7d": 7, "30d": 30, "90d": 90, "all": None}
+DAY_MS = 86_400_000
+ACCOUNT_SAMPLE_MAX_AGE_MS = 120_000
 
 
 class StateStoreError(Exception):
@@ -1060,11 +1066,25 @@ class LendingStateStore(ManualProtectionStore):
         target_mode=None,
         manual_required=False,
         now_ms=None,
+        pause_live=False,
     ):
         now = int(now_ms if now_ms is not None else self._now_ms())
         with self.transaction(immediate=True) as connection:
             runtime = connection.execute("SELECT * FROM runtime_state WHERE singleton=1").fetchone()
             current = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
+            if pause_live:
+                if current["active"] or runtime["mode"] != "LIVE":
+                    return self._recovery_payload(current)
+                connection.execute(
+                    """UPDATE runtime_state SET mode='PAUSED', previous_mode='LIVE', safe_reason=NULL,
+                       consistent_syncs=0, last_consistent_sync_ms=NULL, updated_at_ms=? WHERE singleton=1""",
+                    (now,),
+                )
+                connection.execute(
+                    """INSERT INTO mode_events(from_mode,to_mode,reason,created_at_ms)
+                       VALUES('LIVE','PAUSED',?,?)""",
+                    (f"AUTO_RECOVERY:{category}", now),
+                )
             origin = str(origin_mode or runtime["previous_mode"] or runtime["mode"] or "PAUSED").upper()
             target = str(target_mode or ("LIVE" if origin == "LIVE" else origin)).upper()
             if target not in {"LIVE", "PAUSED", "REPLAY"}:
@@ -1098,21 +1118,33 @@ class LendingStateStore(ManualProtectionStore):
                     RECOVERY_REQUIRED_SNAPSHOTS,
                     started,
                     None,
-                    None if manual_required else now + recovery_delay_seconds(attempts) * 1000,
+                    None if manual_required else now + recovery_delay_seconds(
+                        attempts, network=is_live_network_recovery(category, target),
+                    ) * 1000,
                     str(reason),
                     int(bool(manual_required)),
                 ),
             )
         return self.recovery_status()
 
-    def record_recovery_failure(self, error_text, category=None, now_ms=None):
+    def record_recovery_failure(self, error_text, category=None, now_ms=None, *,
+                                expected_started_at=None):
         now = int(now_ms if now_ms is not None else self._now_ms())
         with self.transaction(immediate=True) as connection:
             row = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
-            if not row["active"] or row["manual_required"]:
+            if (not row["active"] or row["manual_required"]
+                    or (expected_started_at is not None and row["started_at_ms"] != expected_started_at)):
                 return self._recovery_payload(row)
             attempts = int(row["attempts"] or 0) + 1
-            delay = recovery_delay_seconds(attempts - 1)
+            # A later transport error must not bypass the checks imposed by a
+            # previous account, rate-limit or ambiguous-write failure.
+            if category in (None, "NETWORK_TRANSPORT"):
+                category = row["category"] or category
+            minimum_delay = (max(60, getattr(error_text, "retry_after_seconds", 0))
+                             if getattr(error_text, "status_code", None) == 429 else 0)
+            delay = max(minimum_delay, recovery_delay_seconds(
+                attempts - 1, network=is_live_network_recovery(category, row["target_mode"]),
+            ))
             connection.execute(
                 """UPDATE recovery_state SET category=COALESCE(?, category), attempts=?,
                    successful_snapshots=0, last_probe_at_ms=?, next_probe_at_ms=?,
@@ -1120,6 +1152,19 @@ class LendingStateStore(ManualProtectionStore):
                 (category, attempts, now, now + delay * 1000, str(error_text)),
             )
         return self.recovery_status()
+
+    def expedite_network_probe(self, started_at_ms, offer_updated_at_ms, now_ms):
+        with self.transaction(immediate=True) as connection:
+            return bool(connection.execute(
+                """UPDATE recovery_state SET next_probe_at_ms=? WHERE singleton=1 AND active=1
+                   AND started_at_ms=? AND started_at_ms<=? AND category='NETWORK_TRANSPORT'
+                   AND target_mode='LIVE' AND manual_required=0 AND successful_snapshots=0
+                   AND next_probe_at_ms>? AND EXISTS (SELECT 1 FROM runtime_state
+                       WHERE singleton=1 AND mode='PAUSED' AND safe_manual=0)
+                   AND NOT EXISTS (SELECT 1 FROM order_intents
+                       WHERE state IN ('PLANNED','SUBMITTING','AMBIGUOUS'))""",
+                (now_ms, started_at_ms, offer_updated_at_ms, now_ms),
+            ).rowcount)
 
     def recovery_probe_due(self, now_ms=None):
         now = int(now_ms if now_ms is not None else self._now_ms())
@@ -1131,28 +1176,34 @@ class LendingStateStore(ManualProtectionStore):
             and (row["next_probe_at_ms"] is None or now >= int(row["next_probe_at_ms"]))
         )
 
-    def record_recovery_snapshot(self, now_ms=None):
+    def record_recovery_snapshot(self, now_ms=None, *, expected_started_at=None, probe_started_at=None):
         now = int(now_ms if now_ms is not None else self._now_ms())
         resumed = False
         with self.transaction(immediate=True) as connection:
             row = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
-            if not row["active"] or row["manual_required"]:
+            runtime = connection.execute("SELECT mode, safe_manual FROM runtime_state WHERE singleton=1").fetchone()
+            if (not row["active"] or row["manual_required"] or runtime["safe_manual"]
+                    or (expected_started_at is not None and row["started_at_ms"] != expected_started_at)):
                 return {"resumed": False, "recovery": self._recovery_payload(row)}
             last = row["last_probe_at_ms"]
             count = int(row["successful_snapshots"] or 0)
-            if last is None or now - int(last) >= RECOVERY_MINIMUM_GAP_MS:
-                count += 1
+            required = int(row["required_snapshots"] or RECOVERY_REQUIRED_SNAPSHOTS)
+            network = is_live_network_recovery(row["category"], row["target_mode"])
+            gap = NETWORK_RECOVERY_MINIMUM_GAP_MS if network else RECOVERY_MINIMUM_GAP_MS
+            probe_started = now if probe_started_at is None else probe_started_at
+            counted = last is None or (network and not count) or probe_started - int(last) >= gap
+            if counted:
+                count = min(count + 1, required)
                 connection.execute(
                     """UPDATE recovery_state SET successful_snapshots=?, last_probe_at_ms=?,
                        next_probe_at_ms=?, last_error=NULL WHERE singleton=1""",
-                    (count, now, now + RECOVERY_MINIMUM_GAP_MS),
+                    (count, now, now + gap),
                 )
             unresolved = connection.execute(
                 "SELECT COUNT(*) FROM order_intents WHERE state IN ('PLANNED','SUBMITTING','AMBIGUOUS')"
             ).fetchone()[0]
-            if count >= int(row["required_snapshots"] or RECOVERY_REQUIRED_SNAPSHOTS) and not unresolved:
+            if counted and count >= required and not unresolved:
                 target = row["target_mode"] if row["target_mode"] in {"LIVE", "PAUSED", "REPLAY"} else "PAUSED"
-                current_mode = connection.execute("SELECT mode FROM runtime_state WHERE singleton=1").fetchone()[0]
                 connection.execute(
                     """UPDATE runtime_state SET mode=?, previous_mode=NULL, safe_reason=NULL,
                        safe_manual=0, consistent_syncs=0, last_consistent_sync_ms=NULL,
@@ -1161,7 +1212,7 @@ class LendingStateStore(ManualProtectionStore):
                 )
                 connection.execute(
                     "INSERT INTO mode_events(from_mode,to_mode,reason,created_at_ms) VALUES(?,?,?,?)",
-                    (current_mode, target, "automatic recovery confirmed", now),
+                    (runtime["mode"], target, "automatic recovery confirmed", now),
                 )
                 connection.execute(
                     """UPDATE recovery_state SET active=0, successful_snapshots=0,
@@ -1270,8 +1321,8 @@ class LendingStateStore(ManualProtectionStore):
         now = int(now_ms if now_ms is not None else self._now_ms())
         recovery = self.recovery_status()
         if recovery["active"]:
-            result = self.record_recovery_snapshot(now)
-            return self.runtime() if result["resumed"] else self.runtime()
+            self.record_recovery_snapshot(now)
+            return self.runtime()
         with self.transaction(immediate=True) as connection:
             row = connection.execute("SELECT * FROM runtime_state WHERE singleton = 1").fetchone()
             if (
@@ -2596,6 +2647,25 @@ class LendingStateStore(ManualProtectionStore):
             ).fetchone()
         return None if row is None else {**dict(row), "result": json.loads(row["result_json"])}
 
+    def replenishment_slice_key(self, base_key):
+        base_key = str(base_key)
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                """SELECT slice_key, state FROM order_intents
+                   WHERE slice_key = ? OR slice_key LIKE ? ORDER BY id""",
+                (base_key, base_key + ":r%"),
+            ).fetchall()
+        if not rows:
+            return base_key
+        latest = rows[-1]
+        if latest["state"] != "CLOSED":
+            return latest["slice_key"]
+        return f"{base_key}:r{len(rows)}"
+
+    @staticmethod
+    def _reprice_chain_key(strategy_version, slice_key):
+        return f"{strategy_version}|{base_slice_key(slice_key)}"
+
     def set_rollout(self, candidate_version, candidate_share, status="ACTIVE", reason=""):
         share = int(candidate_share)
         if share not in {0, 10, 25, 50, 100}:
@@ -2622,24 +2692,6 @@ class LendingStateStore(ManualProtectionStore):
             ).fetchone()
         return None if row is None else dict(row)
 
-    def replenishment_slice_key(self, base_key):
-        base_key = str(base_key)
-        with self.read_connection() as connection:
-            rows = connection.execute(
-                """SELECT slice_key, state FROM order_intents
-                   WHERE slice_key = ? OR slice_key LIKE ? ORDER BY id""",
-                (base_key, base_key + ":r%"),
-            ).fetchall()
-        if not rows:
-            return base_key
-        latest = rows[-1]
-        if latest["state"] != "CLOSED":
-            return latest["slice_key"]
-        return f"{base_key}:r{len(rows)}"
-
-    @staticmethod
-    def _reprice_chain_key(strategy_version, slice_key):
-        return f"{strategy_version}|{base_slice_key(slice_key)}"
 
     @staticmethod
     def _strategy_reprice_stage_count(
@@ -3960,16 +4012,26 @@ class LendingStateStore(ManualProtectionStore):
             rows = connection.execute(query, tuple(params)).fetchall()
         return [json.loads(row["payload_json"]) for row in rows]
 
-    def record_book_snapshot(self, book, source="REST", now_ms=None):
+    def record_book_snapshot(self, book, source="REST", now_ms=None, *, defer_if_busy=False):
         now = int(now_ms if now_ms is not None else self._now_ms())
         bucket = now - (now % 60_000)
         payload = json.dumps(book or [], ensure_ascii=False, sort_keys=True, default=str)
-        with self.transaction(immediate=True) as connection:
-            connection.execute(
-                """INSERT OR REPLACE INTO book_snapshots(mts, source, book_json, observed_at_ms)
-                   VALUES(?, ?, ?, ?)""",
-                (bucket, str(source), payload, now),
-            )
+        try:
+            with self.transaction(immediate=True, timeout_seconds=0.05 if defer_if_busy else None) as connection:
+                connection.execute(
+                    """INSERT INTO book_snapshots(mts, source, book_json, observed_at_ms)
+                       VALUES(?, ?, ?, ?)
+                       ON CONFLICT(mts) DO UPDATE SET source=excluded.source,
+                           book_json=excluded.book_json, observed_at_ms=excluded.observed_at_ms
+                       WHERE book_snapshots.observed_at_ms IS NULL
+                          OR excluded.observed_at_ms >= book_snapshots.observed_at_ms""",
+                    (bucket, str(source), payload, now),
+                )
+        except sqlite3.OperationalError as error:
+            if not defer_if_busy or not any(word in str(error).lower() for word in ("busy", "locked")):
+                raise
+            return False
+        return True
 
     def book_snapshots(self, start_ms=0, end_ms=None):
         query = "SELECT * FROM book_snapshots WHERE mts >= ?"
@@ -4191,7 +4253,8 @@ class LendingStateStore(ManualProtectionStore):
             )
         return self.income_sync_state(currency)
 
-    def realized_income(self, currency="USD", start_ms=None, end_ms=None):
+    @staticmethod
+    def _income_rows(connection, currency, start_ms, end_ms):
         clauses = ["currency = ?", "wallet = 'funding'", "category = 28", "CAST(amount AS REAL) > 0"]
         params = [str(currency).upper()]
         if start_ms is not None:
@@ -4200,10 +4263,13 @@ class LendingStateStore(ManualProtectionStore):
         if end_ms is not None:
             clauses.append("mts <= ?")
             params.append(int(end_ms))
+        return connection.execute(
+            f"SELECT mts, amount FROM ledger_entries WHERE {' AND '.join(clauses)}", tuple(params)
+        ).fetchall()
+
+    def realized_income(self, currency="USD", start_ms=None, end_ms=None):
         with self.read_connection() as connection:
-            rows = connection.execute(
-                f"SELECT amount FROM ledger_entries WHERE {' AND '.join(clauses)}", tuple(params)
-            ).fetchall()
+            rows = self._income_rows(connection, currency, start_ms, end_ms)
         return sum((D(row["amount"]) for row in rows), D("0"))
 
     def realized_income_summary(self, currency="USD", now_ms=None):
@@ -4241,25 +4307,13 @@ class LendingStateStore(ManualProtectionStore):
             "error": state["error"],
         }
 
-    def statistics(self, window_days=None, now_ms=None):
-        now = int(now_ms if now_ms is not None else self._now_ms())
-        start = 0 if window_days is None else now - int(window_days) * 86_400_000
-        with self.read_connection() as connection:
-            connection.execute("BEGIN")
-            rows = connection.execute("SELECT * FROM account_samples WHERE mts >= ? ORDER BY mts", (start,)).fetchall()
-            reprices = connection.execute(
-                "SELECT COUNT(*) AS count FROM reprice_events WHERE created_at_ms >= ?", (start,)
-            ).fetchone()["count"]
-            waits = self._funding_wait_records(connection, "USD", start, now + 1)
-            closures = connection.execute(
-                "SELECT * FROM credit_closures WHERE closed_at_ms >= ? ORDER BY closed_at_ms",
-                (start,),
-            ).fetchall()
+    @staticmethod
+    def _closure_statistics(closures):
         attributed = {}
         early = 0
         for row in closures:
             opened = row["opened_at_ms"] or row["closed_at_ms"]
-            elapsed_days = D(max(0, row["closed_at_ms"] - opened)) / D("86400000")
+            elapsed_days = D(max(0, row["closed_at_ms"] - opened)) / D(DAY_MS)
             contractual_days = D(max(1, row["period"]))
             if elapsed_days + D("0.000001") < contractual_days:
                 early += 1
@@ -4269,54 +4323,116 @@ class LendingStateStore(ManualProtectionStore):
             order_type = row["rate_type"] if row["managed"] and row["rate_type"] else "EXTERNAL"
             key = f"{pool}:{order_type}"
             attributed[key] = attributed.get(key, D("0")) + earned
-        details = {
-            **self._funding_wait_summary(waits),
+        return {
             "earlyReturnPercent": _decimal_text(D(early) / D(len(closures)) * D("100")) if closures else "0",
             "closedCreditCount": len(closures),
             "returnsByPoolAndType": {key: _decimal_text(value) for key, value in sorted(attributed.items())},
         }
-        ledger_interest = self.realized_income("USD", None if window_days is None else start, now)
-        if not rows:
-            return {
-                "windowDays": window_days,
-                "sampleFrom": None,
-                "sampleTo": None,
-                "sampleDays": "0",
-                "utilizationPercent": "0",
-                "netInterest": _decimal_text(ledger_interest),
-                "actualNetAprPercent": "0",
-                "idlePrincipalTime": "0",
-                "repriceCount": reprices,
-                **details,
+
+    @staticmethod
+    def _sample_statistics(samples, starts, windows, now):
+        # Walk from newest to oldest once, reusing the running totals at each window boundary.
+        remaining = iter(reversed(samples))
+        row = next(remaining, None)
+        newest = row["mts"] if row is not None else None
+        end = now
+        principal_ms = utilized_ms = idle_ms = observed_principal_ms = observed_utilized_ms = D("0")
+        observed_ms = 0
+        result = {}
+        for key, start in sorted(starts.items(), key=lambda item: item[1], reverse=True):
+            while row is not None and row["mts"] >= start:
+                duration = end - row["mts"]
+                observed = min(duration, ACCOUNT_SAMPLE_MAX_AGE_MS)
+                total = D(row["total_principal"])
+                utilized = D(row["active_credits"])
+                principal = total * duration
+                funded = utilized * duration
+                principal_ms += principal
+                utilized_ms += funded
+                idle_ms += max(D("0"), principal - funded)
+                observed_ms += observed
+                observed_principal_ms += principal if observed == duration else total * observed
+                observed_utilized_ms += funded if observed == duration else utilized * observed
+                end = row["mts"]
+                row = next(remaining, None)
+
+            sample_from = end if newest is not None and newest >= start else None
+            span_start = start if windows[key] is not None else sample_from
+            span_ms = max(0, now - span_start) if span_start is not None else 0
+            # The preceding sample can still cover part of a bounded window.
+            covered = observed_ms
+            covered_principal = observed_principal_ms
+            covered_utilized = observed_utilized_ms
+            if row is not None and windows[key] is not None:
+                overlap = max(0, min(end, row["mts"] + ACCOUNT_SAMPLE_MAX_AGE_MS) - start)
+                if overlap:
+                    covered += overlap
+                    covered_principal += D(row["total_principal"]) * overlap
+                    covered_utilized += D(row["active_credits"]) * overlap
+
+            result[key] = (principal_ms / D(DAY_MS), {
+                "sampleFrom": sample_from,
+                "sampleTo": newest if sample_from is not None else None,
+                "sampleDays": _decimal_text(D(newest - sample_from) / D(DAY_MS)) if sample_from is not None else "0",
+                "utilizationPercent": _decimal_text(utilized_ms / principal_ms * D("100")) if principal_ms > 0 else "0",
+                "idlePrincipalTime": _decimal_text(idle_ms / D(DAY_MS)),
+                "sampleCoveragePercent": _decimal_text(D(covered) / D(span_ms) * D("100")) if span_ms else "0",
+                "observedUtilizationPercent": (
+                    _decimal_text(covered_utilized / covered_principal * D("100")) if covered_principal > 0 else None
+                ),
+            })
+        return result
+
+    def statistics_windows(self, now_ms=None, *, windows=STATISTICS_WINDOWS):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        starts = {key: 0 if days is None else now - int(days) * DAY_MS for key, days in windows.items()}
+        earliest = min(starts.values())
+        with self.read_connection() as connection:
+            connection.execute("BEGIN")
+            predecessor = connection.execute(
+                "SELECT MAX(mts) FROM account_samples WHERE mts >= ? AND mts < ?",
+                (earliest - ACCOUNT_SAMPLE_MAX_AGE_MS, earliest),
+            ).fetchone()[0]
+            samples = connection.execute(
+                """SELECT mts, total_principal, active_credits FROM account_samples
+                   WHERE mts BETWEEN ? AND ? ORDER BY mts""",
+                (earliest if predecessor is None else predecessor, now),
+            ).fetchall()
+            reprices = [row[0] for row in connection.execute(
+                "SELECT created_at_ms FROM reprice_events WHERE created_at_ms BETWEEN ? AND ? ORDER BY created_at_ms",
+                (earliest, now),
+            )]
+            waits = self._funding_wait_records(connection, "USD", earliest, now + 1)
+            closures = connection.execute(
+                "SELECT * FROM credit_closures WHERE closed_at_ms BETWEEN ? AND ? ORDER BY closed_at_ms",
+                (earliest, now),
+            ).fetchall()
+            ledger = [(row["mts"], D(row["amount"])) for row in self._income_rows(
+                connection, "USD", None if None in windows.values() else earliest, now,
+            )]
+
+        exposures = self._sample_statistics(samples, starts, windows, now)
+        result = {}
+        for key, days in windows.items():
+            start = starts[key]
+            principal_time, sample_fields = exposures[key]
+            interest = sum((amount for mts, amount in ledger if days is None or mts >= start), D("0"))
+            sample_from = sample_fields["sampleFrom"]
+            apr = D("0")
+            if principal_time > 0:
+                apr_interest = sum((amount for mts, amount in ledger if mts >= sample_from), D("0"))
+                apr = apr_interest / principal_time * D("365")
+            result[key] = {
+                "windowDays": days,
+                "calculatedAtMs": now,
+                **sample_fields,
+                "netInterest": _decimal_text(interest),
+                "actualNetAprPercent": _decimal_text(apr * D("100")),
+                "repriceCount": len(reprices) - bisect_left(reprices, start),
+                **self._funding_wait_summary([row for row in waits if row["mts"] >= start]),
+                **self._closure_statistics([row for row in closures if row["closed_at_ms"] >= start]),
             }
-        utilized_time = D("0")
-        principal_time = D("0")
-        idle_time = D("0")
-        for index, row in enumerate(rows):
-            end = rows[index + 1]["mts"] if index + 1 < len(rows) else now
-            duration_days = D(max(0, end - row["mts"])) / D("86400000")
-            total = D(row["total_principal"])
-            utilized = D(row["active_credits"])
-            principal_time += total * duration_days
-            utilized_time += utilized * duration_days
-            idle_time += max(D("0"), total - utilized) * duration_days
-        # APR is estimated only for the period where principal samples exist.
-        # The displayed realized income can cover a wider ledger interval.
-        apr_interest = self.realized_income("USD", max(start, int(rows[0]["mts"])), now)
-        sample_from = int(rows[0]["mts"])
-        sample_to = int(rows[-1]["mts"])
-        sample_days = D(max(0, sample_to - sample_from)) / D("86400000")
-        utilization = D("0") if principal_time <= 0 else utilized_time / principal_time
-        apr = D("0") if principal_time <= 0 else apr_interest / principal_time * D("365")
-        return {
-            "windowDays": window_days,
-            "sampleFrom": sample_from,
-            "sampleTo": sample_to,
-            "sampleDays": _decimal_text(sample_days),
-            "utilizationPercent": _decimal_text(utilization * D("100")),
-            "netInterest": _decimal_text(ledger_interest),
-            "actualNetAprPercent": _decimal_text(apr * D("100")),
-            "idlePrincipalTime": _decimal_text(idle_time),
-            "repriceCount": reprices,
-            **details,
-        }
+        return result
+
+    def statistics(self, window_days=None, now_ms=None):
+        return self.statistics_windows(now_ms, windows={"window": window_days})["window"]

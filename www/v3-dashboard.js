@@ -5,7 +5,7 @@
 
     const state = {
         policy: null, runtime: null, preview: null, previewPolicy: null, dirty: false,
-        draftVersionId: null, applyToken: null,
+        draftVersionId: null, applyToken: null, statistics: null,
     };
     const byId = (id) => document.getElementById(id);
     const dashboardCsrf = document.querySelector('meta[name="mika-dashboard-csrf"]')?.content || "";
@@ -176,7 +176,15 @@
                         <div><dt>计划订单</dt><dd id="v3PlanCount">--</dd></div>
                     </dl></section>
                     <section><h2>计划分布</h2><div id="v3PlanList" class="v3-plan-list"><p>等待预览</p></div></section>
-                    <section><h2>实际统计</h2><div id="v3Stats" class="v3-stats"></div></section>
+                    <section>
+                        <div class="v3-stats-heading">
+                            <h2>实际统计</h2>
+                            <button id="v3StatsRefresh" class="button secondary" type="button">刷新统计</button>
+                        </div>
+                        <p id="v3StatsEmpty">暂无统计快照，可刷新历史统计</p>
+                        <p id="v3StatsMessage" role="status"></p>
+                        <div id="v3Stats" class="v3-stats"></div>
+                    </section>
                     <section><h2>期限自主选择</h2><div id="v3PeriodSelection" class="v3-period-selection"><p>等待市场评分</p></div></section>
                     <section><h2>近24小时期限分布</h2><div id="v3PeriodActivity" class="v3-period-activity"><p>等待运行数据</p></div></section>
                 </aside>
@@ -542,12 +550,48 @@
             const apr = document.createElement("b");
             const coverage = document.createElement("small");
             heading.textContent = key === "all" ? "全部" : key;
-            utilization.textContent = `利用率 ${Number(row.utilizationPercent).toFixed(1)}%`;
-            interest.textContent = `净利息 ${Number(row.netInterest).toFixed(4)} USD`;
-            apr.textContent = `净APR ${Number(row.actualNetAprPercent).toFixed(2)}%`;
-            coverage.textContent = `本金采样覆盖 ${Number(row.sampleDays || 0).toFixed(2)} 天`;
+            if (row.observedUtilizationPercent === undefined) {
+                utilization.textContent = `利用率（估算） ${Number(row.utilizationPercent).toFixed(1)}%`;
+            } else {
+                const value = row.observedUtilizationPercent;
+                utilization.textContent = `可观测利用率 ${value == null ? "--" : `${Number(value).toFixed(1)}%`}`;
+            }
+            interest.textContent = `到账净利息 ${Number(row.netInterest).toFixed(4)} USD`;
+            apr.textContent = `净 APR（估算） ${Number(row.actualNetAprPercent).toFixed(2)}%`;
+            coverage.textContent = row.sampleCoveragePercent == null
+                ? `采样跨度 ${Number(row.sampleDays || 0).toFixed(2)} 天`
+                : `采样覆盖 ${Number(row.sampleCoveragePercent).toFixed(1)}%`;
+            if (row.calculatedAtMs != null) {
+                coverage.textContent += ` · ${new Date(row.calculatedAtMs).toLocaleTimeString("zh-CN")}`;
+            }
             item.append(heading, utilization, interest, apr, coverage);
             container.append(item);
+        }
+    }
+
+    function updateStatistics(statistics) {
+        const nextTimestamp = statistics?.all?.calculatedAtMs;
+        const currentTimestamp = state.statistics?.all?.calculatedAtMs;
+        if (!statistics || !Object.keys(statistics).length) return false;
+        if (currentTimestamp != null && (nextTimestamp == null || nextTimestamp <= currentTimestamp)) return true;
+        state.statistics = statistics;
+        byId("v3StatsEmpty").hidden = true;
+        renderStats(statistics);
+        return true;
+    }
+
+    async function refreshStatistics() {
+        const button = byId("v3StatsRefresh");
+        const message = byId("v3StatsMessage");
+        button.disabled = true;
+        message.textContent = "正在读取历史统计…";
+        try {
+            const data = await requestJson("/api/stats/v3");
+            message.textContent = updateStatistics(data.statistics) ? "" : "暂无历史统计";
+        } catch (error) {
+            message.textContent = `统计刷新失败：${error.message}`;
+        } finally {
+            button.disabled = false;
         }
     }
 
@@ -561,17 +605,15 @@
             return false;
         }
 
-        const [runtimeResult, statusResult, statsResult] = await Promise.allSettled([
-                requestJson("/api/runtime/v3"),
-                requestJson("/api/status"),
-                requestJson("/api/stats/v3"),
+        const [runtimeResult, statusResult] = await Promise.allSettled([
+            requestJson("/api/runtime/v3"),
+            requestJson("/api/status"),
         ]);
         const runtime = runtimeResult.status === "fulfilled" ? runtimeResult.value : {};
         const status = statusResult.status === "fulfilled" ? statusResult.value : {};
-        const stats = statsResult.status === "fulfilled" ? statsResult.value : {};
         renderRuntime(runtime, status);
-        renderStats(stats.statistics);
-        const failures = [runtimeResult, statusResult, statsResult]
+        updateStatistics(status.statistics);
+        const failures = [runtimeResult, statusResult]
             .filter((result) => result.status === "rejected")
             .map((result) => result.reason?.message || "未知错误");
         if (failures.length) {
@@ -684,6 +726,7 @@
     byId("v3PauseButton").addEventListener("click", () => setMode("PAUSED"));
     byId("v3ReplayButton").addEventListener("click", () => setMode("REPLAY"));
     byId("v3LiveButton").addEventListener("click", () => byId("preflightButton")?.click());
+    byId("v3StatsRefresh").addEventListener("click", refreshStatistics);
     loadAll().then((loaded) => { if (loaded) preview(); });
     window.setInterval(loadAll, 15000);
 })();
