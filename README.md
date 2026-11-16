@@ -1,6 +1,6 @@
 # Mika Lending Bot · Bitfinex USD 自动放贷
 
-[预览版 Windows CI 已通过](https://github.com/litianyu529-stack/mika-bitfinex-lending/actions/runs/42516970133)
+[![预览版 Windows CI](https://github.com/litianyu529-stack/mika-bitfinex-lending/actions/workflows/windows-verify.yml/badge.svg?branch=release%2Fv0.3.6.2-rc.1)](https://github.com/litianyu529-stack/mika-bitfinex-lending/actions/workflows/windows-verify.yml?query=branch%3Arelease%2Fv0.3.6.2-rc.1)
 [![正式版](https://img.shields.io/github/v/release/litianyu529-stack/mika-bitfinex-lending?label=stable)](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -8,13 +8,13 @@
 
 *Automated Bitfinex USD funding for Windows with a local dashboard, configurable lending limits, and order reconciliation.*
 
-**[下载正式版](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/latest)** · [下载 v0.3.6.1-rc.1 预览版](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/tag/v0.3.6.1-rc.1) · [Windows 快速开始](#快速开始) · [反馈问题](https://github.com/litianyu529-stack/mika-bitfinex-lending/issues)
+**[下载正式版](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/latest)** · [下载 v0.3.6.2-rc.1 预览版](https://github.com/litianyu529-stack/mika-bitfinex-lending/releases/tag/v0.3.6.2-rc.1) · [Windows 快速开始](#快速开始) · [反馈问题](https://github.com/litianyu529-stack/mika-bitfinex-lending/issues)
 
 ![Mika Lending Bot 总览，显示模拟余额、资金分布和挂单状态](docs/dashboard-preview.png)
 
 *控制台总览 · 演示数据*
 
-上方正式版链接指向 v0.3.5.1。预览版包含两小时手动挂单保护和 Schema 19。
+上方正式版链接指向 v0.3.5.1。v0.3.6.2 预览版包含两小时手动挂单保护、Schema 19 和更快的断连恢复。收到新的 USD 挂单变更后可提前触发完整只读对账。纯网络断连在两次完整对账通过且无未决操作后恢复实盘，两次检查间隔至少 15 秒。
 
 - **控制资金与利率**：为三个期限池设置最低净年化，并限制可参与放贷的金额。
 - **先对账再恢复**：提交或撤单结果不明时，核对交易所记录后才继续写入。
@@ -30,7 +30,7 @@
 - 机器人只撤改 SQLite 中能够证明归属的挂单。V3.5 对外部 fUSD 挂单执行两次至少间隔 30 秒且账户守恒的权威快照确认，确认后自动托管并只按具体 Offer ID 撤销；外部 Credits 不接管、不关闭。
 - 短/中/长比例约束当前托管未成交挂单金额，已成交 Credits 只计入资金上限；已有有效挂单随新增资金逐步收敛，比例偏离本身不会触发撤单。
 - 提交、撤单和钱包转账统一区分 `CONFIRMED / DEFINITE_REJECT / UNKNOWN`。请求发出后的超时、断线、截断响应、非法 JSON 或提交成功但缺少 Offer ID 都属于 `UNKNOWN`；先停止写入并对账，不会盲目重复请求。
-- 除人工暂停/停止外，网络、认证、配置、市场数据、账户数据、程序异常和 Worker 重启故障都会统一进入 PAUSED 的只读恢复循环，并在两次完整 REST 同步（至少间隔 30 秒）后自动恢复此前模式。不确定撤单会用 Offers 快照确认存在或消失后恢复；不确定提交会用请求时间附近的 Offers、Funding Trades 和历史 Offers 唯一绑定，或在两次权威快照确认不存在后关闭。多个候选会持续自动对账，但在无法唯一确认前绝不重新写入。
+- 正式版的自动恢复须用两次至少间隔 30 秒的完整 REST 同步确认。预览版的纯网络断连采用上面的 15 秒确认间隔。不确定撤单会用 Offers 快照确认存在或消失后恢复；不确定提交会用请求时间附近的 Offers、Funding Trades 和历史 Offers 唯一绑定，或在两次权威快照确认不存在后关闭。多个候选会持续自动对账，但在无法唯一确认前绝不重新写入。
 - WebSocket 每代连接必须重新收到 Book、Wallet、Offers、Credits 快照；新 Book snapshot 会清空上一代盘口。快照未齐全时只能使用新鲜 REST 完整降级数据。
 - Dashboard 只绑定 `127.0.0.1:8000`。所有 POST 要求同源 Host/Origin、随机 CSRF 头、JSON Content-Type，且请求体不超过 64 KiB。
 - SQLite 使用显式 Schema 16。升级前在线备份，迁移在事务中完成；人工 PAUSED 状态不会因迁移自动启动。
