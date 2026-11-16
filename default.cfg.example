@@ -53,6 +53,10 @@ hidden_max_share =
 
 minimum_offer_minutes = 5
 balanced_start_premium_percent = 5
+# Existing installations keep EXPLORATION_V4 until V3.6 validation is approved.
+quick_pricing_mode = EXPLORATION_V4
+# Net annual percentage POINTS: reference 6% plus 0.10 points means 6.10%.
+quick_start_premium_apr_points = 0.10
 high_start_premium_percent = 12
 balanced_landing_stage = 5
 high_landing_stage = 7

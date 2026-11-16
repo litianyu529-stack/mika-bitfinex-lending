@@ -25,6 +25,7 @@ class StatusLogger:
 
 def test_recovery_backoff_caps_at_five_minutes():
     assert [recovery_delay_seconds(item) for item in range(6)] == [30, 60, 120, 300, 300, 300]
+    assert [recovery_delay_seconds(item, network=True) for item in range(7)] == [5, 10, 20, 40, 60, 120, 120]
 
 
 @pytest.mark.parametrize(
@@ -217,6 +218,39 @@ def test_manual_dashboard_pause_clears_auto_recovery(tmp_path):
     assert store.runtime()["mode"] == "PAUSED"
 
 
+def test_manual_pause_invalidates_in_flight_network_check(tmp_path):
+    store = LendingStateStore(tmp_path / "state.sqlite3", clock=lambda: 1000)
+    store.set_mode("LIVE", "test")
+    episode = store.begin_recovery("NETWORK_TRANSPORT", "offline", pause_live=True)
+    started = episode["startedAt"]
+    store.record_recovery_snapshot(started + 5000, expected_started_at=started)
+    assert store.recovery_status()["successfulSnapshots"] == 1
+
+    store.set_mode("PAUSED", "dashboard_pause")
+    assert not store.expedite_network_probe(started, started + 18_000, started + 18_000)
+    assert not store.record_recovery_snapshot(started + 21_000, expected_started_at=started)["resumed"]
+    store.record_recovery_failure("late failure", "NETWORK_TRANSPORT", started + 21_000, expected_started_at=started)
+    assert not store.recovery_status()["active"]
+    assert store.runtime()["mode"] == "PAUSED"
+
+
+@pytest.mark.parametrize("category", ["ACCOUNT_DATA", "AUTH_PERMISSION", "AMBIGUOUS_WRITE"])
+def test_other_recovery_causes_keep_protective_timing_after_a_network_error(tmp_path, category):
+    store = LendingStateStore(tmp_path / "state.sqlite3", clock=lambda: 1000)
+    store.set_mode("LIVE", "test")
+    episode = store.begin_recovery("NETWORK_TRANSPORT", "offline", pause_live=True)
+    started = episode["startedAt"]
+    store.record_recovery_failure("protected", category, started + 5000)
+    recovery = store.record_recovery_failure("offline again", "NETWORK_TRANSPORT", started + 35_000)
+    assert recovery["category"] == category
+    assert recovery["nextProbeAt"] == started + 95_000
+    assert not store.expedite_network_probe(started, started + 36_000, started + 36_000)
+
+    assert store.record_recovery_snapshot(started + 95_000)["recovery"]["successfulSnapshots"] == 1
+    assert not store.record_recovery_snapshot(started + 110_000)["resumed"]
+    assert store.record_recovery_snapshot(started + 125_000)["resumed"]
+
+
 def test_schema_16_preserves_runtime_and_adds_recovery_and_allocation_state(tmp_path):
     path = tmp_path / "state.sqlite3"
     store = LendingStateStore(path)
@@ -225,7 +259,7 @@ def test_schema_16_preserves_runtime_and_adds_recovery_and_allocation_state(tmp_
         version = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
         integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
         recovery_rows = connection.execute("SELECT COUNT(*) FROM recovery_state").fetchone()[0]
-    assert (version, integrity, recovery_rows) == ("16", "ok", 1)
+    assert (version, integrity, recovery_rows) == ("19", "ok", 1)
 
 
 class OneSupervisorIteration:

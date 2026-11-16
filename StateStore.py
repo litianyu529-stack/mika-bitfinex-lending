@@ -4,17 +4,24 @@ import os
 import sqlite3
 import threading
 import time
+from bisect import bisect_left
 from collections import defaultdict
 from contextlib import contextmanager
 from decimal import Decimal
 
 from WriteRecovery import can_clear_ambiguous_pause, restart_transition, unique_unbound_candidate
+from ExchangeModels import funding_offer_effective_rate
 from Recovery import (
+    NETWORK_RECOVERY_MINIMUM_GAP_MS,
     RECOVERY_MINIMUM_GAP_MS,
     RECOVERY_REQUIRED_SNAPSHOTS,
+    is_live_network_recovery,
     recovery_category_for_reason,
     recovery_delay_seconds,
 )
+from StrategyV3 import QUICK_EXECUTION_CURVE
+from StrategyState import demand_confirmation_transition, period_selection_transition
+from ManualProtection import ManualProtectionStore
 
 
 D = Decimal
@@ -28,8 +35,13 @@ AUTO_RECOVERABLE_PAUSE_REASONS = {
 }
 LEGACY_REPRICE_CURVE = "LEGACY"
 EXACT_TERM_EXPLORATION_CURVE = "EXACT_TERM_EXPLORATION_V4"
-CURRENT_RELEASE = "0.3.5.2"
-CURRENT_RELEASE_LABEL = "V3.5"
+CURRENT_RELEASE = "0.3.6.0"
+CURRENT_RELEASE_LABEL = "V3.6"
+CURRENT_SCHEMA_VERSION = 19
+SCHEMA_FAMILY = "v3"
+STATISTICS_WINDOWS = {"1d": 1, "7d": 7, "30d": 30, "90d": 90, "all": None}
+DAY_MS = 86_400_000
+ACCOUNT_SAMPLE_MAX_AGE_MS = 120_000
 
 
 class StateStoreError(Exception):
@@ -77,12 +89,13 @@ def slice_pool_layer(slice_key):
     return None, None
 
 
-class LendingStateStore:
+class LendingStateStore(ManualProtectionStore):
     def __init__(self, path, clock=time.time):
         self.path = os.path.abspath(path)
         self.clock = clock
         os.makedirs(os.path.dirname(self.path) or os.getcwd(), exist_ok=True)
         self._lock = threading.RLock()
+        self.migration_backup_path = None
         self._backup_before_schema_migration()
         self._initialize()
 
@@ -92,17 +105,18 @@ class LendingStateStore:
     def _backup_before_schema_migration(self):
         if not os.path.exists(self.path) or os.path.getsize(self.path) == 0:
             return
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
         try:
             row = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+            family_row = connection.execute("SELECT value FROM schema_meta WHERE key='schema_family'").fetchone()
         except sqlite3.Error:
             return
         finally:
             connection.close()
         version = 0 if row is None else int(row[0])
-        if version > 16:
-            raise StateStoreError("state database schema is newer than V3.5; use the offline rollback migration")
-        if version >= 16:
+        family = None if family_row is None else family_row[0]
+        self._validate_schema_identity(version, family)
+        if version == CURRENT_SCHEMA_VERSION:
             return
         backup_dir = os.path.join(os.path.dirname(self.path), "backups")
         os.makedirs(backup_dir, exist_ok=True)
@@ -114,17 +128,50 @@ class LendingStateStore:
             suffix += 1
         source = sqlite3.connect(self.path)
         target = sqlite3.connect(backup_path)
+        last_progress_at = time.monotonic()
+        last_remaining = None
+        busy_since = None
+
+        def backup_progress(status, remaining, total):
+            nonlocal busy_since, last_progress_at, last_remaining
+            now = time.monotonic()
+            if status in {sqlite3.SQLITE_OK, sqlite3.SQLITE_DONE} and (
+                last_remaining is None or remaining < last_remaining
+            ):
+                last_progress_at = now
+                last_remaining = remaining
+            if status in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                busy_since = now if busy_since is None else busy_since
+            else:
+                busy_since = None
+            if now - last_progress_at > 300 or (busy_since is not None and now - busy_since > 10):
+                raise StateStoreError(
+                    "schema migration backup timed out; source remains unchanged; "
+                    f"partial backup={backup_path}; status={status}; remaining={remaining}; total={total}"
+                )
         try:
-            source.backup(target)
+            source.backup(target, pages=1000, progress=backup_progress, sleep=0.05)
         finally:
             target.close()
             source.close()
+        self.migration_backup_path = backup_path
 
-    def _connect(self):
-        connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+    @staticmethod
+    def _validate_schema_identity(version, family=None):
+        if version == 17:
+            raise StateStoreError("schema 17 belongs to legacy V4; use the offline rollback migration")
+        if version > CURRENT_SCHEMA_VERSION:
+            raise StateStoreError("state database schema is newer than V3.6; use the offline rollback migration")
+        if family is not None and family != SCHEMA_FAMILY:
+            raise StateStoreError("state database does not belong to the V3 schema family")
+        if version >= 18 and family != SCHEMA_FAMILY:
+            raise StateStoreError("schema 18+ requires the V3 schema family marker")
+
+    def _connect(self, timeout_seconds=30):
+        connection = sqlite3.connect(self.path, timeout=timeout_seconds, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 30000")
+        connection.execute(f"PRAGMA busy_timeout = {max(0, int(timeout_seconds * 1000))}")
         return connection
 
     @contextmanager
@@ -136,9 +183,13 @@ class LendingStateStore:
             connection.close()
 
     @contextmanager
-    def transaction(self, immediate=False):
-        with self._lock:
-            connection = self._connect()
+    def transaction(self, immediate=False, timeout_seconds=None):
+        # Background ingestion may yield immediately to the live writer.
+        acquired = self._lock.acquire(blocking=timeout_seconds is None)
+        if not acquired:
+            raise sqlite3.OperationalError("database is busy")
+        try:
+            connection = self._connect(30 if timeout_seconds is None else timeout_seconds)
             try:
                 connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
                 yield connection
@@ -148,6 +199,8 @@ class LendingStateStore:
                 raise
             finally:
                 connection.close()
+        finally:
+            self._lock.release()
 
     def _initialize(self):
         # Dashboard reads construct stores too. Re-running all migrations under
@@ -158,23 +211,18 @@ class LendingStateStore:
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'"
             ).fetchone()
             if exists:
-                ready = dict(connection.execute("SELECT key,value FROM schema_meta").fetchall())
-                boundary_needs_evidence = (
-                    ready.get("schema_version") == "16"
-                    and ready.get("v35_initialization_complete") == "1"
-                    and "release_0.3.5_boundary_evidence_at_ms" not in ready
-                    and connection.execute(
-                        "SELECT 1 FROM order_intents WHERE pricing_curve_version IN "
-                        "('EXACT_TERM_EXPLORATION_V2','EXACT_TERM_EXPLORATION_V3','EXACT_TERM_EXPLORATION_V4') "
-                        "LIMIT 1"
-                    ).fetchone() is not None
-                )
-                if (
-                    ready.get("schema_version") == "16"
-                    and ready.get("v35_initialization_complete") == "1"
-                    and "release_0.3.5_activated_at_ms" in ready
-                    and not boundary_needs_evidence
-                ):
+                ready = dict(connection.execute(
+                    "SELECT key,value FROM schema_meta WHERE key IN "
+                    "('schema_version','schema_family','v36_initialization_complete','v35_performance_indexes')"
+                ).fetchall())
+                version = int(ready.get("schema_version", "0"))
+                self._validate_schema_identity(version, ready.get("schema_family"))
+                if version == CURRENT_SCHEMA_VERSION and ready.get("v36_initialization_complete") == "1":
+                    if ready.get("v35_performance_indexes") != "1":
+                        self._ensure_performance_indexes()
+                    return
+                if version in (16, 18, CURRENT_SCHEMA_VERSION):
+                    self._migrate_existing_v36()
                     return
         finally:
             connection.close()
@@ -553,9 +601,11 @@ class LendingStateStore:
             self._migrate_v14_pricing_curve_columns(connection)
             self._migrate_v15_exact_reprice_replacements(connection)
             self._migrate_v16_fixed_landing_rate(connection)
+            self._migrate_v18_market_columns(connection)
+            self._migrate_v19_manual_protection(connection)
             connection.execute(
-                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '16')
-                   ON CONFLICT(key) DO UPDATE SET value='16'"""
+                """INSERT INTO schema_meta(key, value) VALUES('schema_version', '19')
+                   ON CONFLICT(key) DO UPDATE SET value='19'"""
             )
             self._initialize_v35_release_boundary(connection, self._now_ms())
             connection.execute(
@@ -581,6 +631,91 @@ class LendingStateStore:
                 (self._now_ms(),),
             )
             connection.execute("INSERT OR REPLACE INTO schema_meta VALUES('v35_initialization_complete','1')")
+            connection.execute("INSERT OR REPLACE INTO schema_meta VALUES('schema_family','v3')")
+            connection.execute("INSERT OR REPLACE INTO schema_meta VALUES('v36_initialization_complete','1')")
+        self._ensure_performance_indexes()
+
+    def _migrate_existing_v36(self):
+        # Schema 16 already completed the V3.5 migrations.  Re-running them can
+        # abandon pending historical chains, so upgrade only the new columns.
+        with self.transaction(immediate=True) as connection:
+            meta = dict(connection.execute("SELECT key,value FROM schema_meta"))
+            version = int(meta.get("schema_version", "0"))
+            self._validate_schema_identity(version, meta.get("schema_family"))
+            if version == CURRENT_SCHEMA_VERSION and meta.get("v36_initialization_complete") == "1":
+                return
+            self._migrate_v18_market_columns(connection)
+            self._migrate_v19_manual_protection(connection)
+            if "release_0.3.5_activated_at_ms" not in meta or (
+                "release_0.3.5_boundary_evidence_at_ms" not in meta
+                and connection.execute(
+                    "SELECT 1 FROM order_intents WHERE pricing_curve_version IN "
+                    "('EXACT_TERM_EXPLORATION_V2','EXACT_TERM_EXPLORATION_V3','EXACT_TERM_EXPLORATION_V4') LIMIT 1"
+                ).fetchone() is not None
+            ):
+                self._initialize_v35_release_boundary(connection, self._now_ms())
+            connection.execute("CREATE INDEX IF NOT EXISTS market_bars_bucket_idx ON market_bars(bucket_ms)")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS funding_trades_currency_managed_mts_idx "
+                "ON funding_trades(currency, managed, mts)"
+            )
+            for key, value in (
+                ("schema_version", "19"), ("schema_family", SCHEMA_FAMILY),
+                ("v36_initialization_complete", "1"), ("v35_performance_indexes", "1"),
+            ):
+                connection.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?,?)", (key, value))
+
+    @staticmethod
+    def _migrate_v18_market_columns(connection):
+        existing = {row["name"] for row in connection.execute("PRAGMA table_info(market_trades)")}
+        if "raw_signed_amount" not in existing:
+            connection.execute("ALTER TABLE market_trades ADD COLUMN raw_signed_amount TEXT")
+        if "source_sequence" not in existing:
+            connection.execute("ALTER TABLE market_trades ADD COLUMN source_sequence INTEGER NOT NULL DEFAULT 0")
+        existing = {row["name"] for row in connection.execute("PRAGMA table_info(book_snapshots)")}
+        if "observed_at_ms" not in existing:
+            connection.execute("ALTER TABLE book_snapshots ADD COLUMN observed_at_ms INTEGER")
+        connection.execute("CREATE INDEX IF NOT EXISTS market_trades_mts_id_idx ON market_trades(mts, trade_id)")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS book_snapshots_visible_idx "
+            "ON book_snapshots(COALESCE(observed_at_ms,mts+60000),mts)"
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS market_dirty_minutes (
+                minute_ms INTEGER PRIMARY KEY,
+                source_sequence INTEGER NOT NULL
+            )"""
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS market_dirty_sequence_idx ON market_dirty_minutes(source_sequence)"
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS market_coverage_intervals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                start_ms INTEGER NOT NULL,
+                end_ms INTEGER NOT NULL CHECK(end_ms>=start_ms),
+                status TEXT NOT NULL,
+                source TEXT NOT NULL,
+                details_json TEXT,
+                recorded_at_ms INTEGER NOT NULL
+            )"""
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS market_coverage_window_idx ON market_coverage_intervals(start_ms,end_ms)"
+        )
+        connection.execute("INSERT OR IGNORE INTO schema_meta(key,value) VALUES('market_source_sequence','0')")
+
+    def _ensure_performance_indexes(self):
+        # The existing market_bars primary key starts with interval_name, so
+        # retention by bucket_ms alone otherwise scans every retained row.
+        # Record completion to keep subsequent Dashboard opens read-only.
+        with self.transaction(immediate=True) as connection:
+            connection.execute("CREATE INDEX IF NOT EXISTS market_bars_bucket_idx ON market_bars(bucket_ms)")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS funding_trades_currency_managed_mts_idx "
+                "ON funding_trades(currency, managed, mts)"
+            )
+            connection.execute("INSERT OR REPLACE INTO schema_meta VALUES('v35_performance_indexes','1')")
 
     @staticmethod
     def _initialize_v35_release_boundary(connection, now_ms):
@@ -926,11 +1061,25 @@ class LendingStateStore:
         target_mode=None,
         manual_required=False,
         now_ms=None,
+        pause_live=False,
     ):
         now = int(now_ms if now_ms is not None else self._now_ms())
         with self.transaction(immediate=True) as connection:
             runtime = connection.execute("SELECT * FROM runtime_state WHERE singleton=1").fetchone()
             current = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
+            if pause_live:
+                if current["active"] or runtime["mode"] != "LIVE":
+                    return self._recovery_payload(current)
+                connection.execute(
+                    """UPDATE runtime_state SET mode='PAUSED', previous_mode='LIVE', safe_reason=NULL,
+                       consistent_syncs=0, last_consistent_sync_ms=NULL, updated_at_ms=? WHERE singleton=1""",
+                    (now,),
+                )
+                connection.execute(
+                    """INSERT INTO mode_events(from_mode,to_mode,reason,created_at_ms)
+                       VALUES('LIVE','PAUSED',?,?)""",
+                    (f"AUTO_RECOVERY:{category}", now),
+                )
             origin = str(origin_mode or runtime["previous_mode"] or runtime["mode"] or "PAUSED").upper()
             target = str(target_mode or ("LIVE" if origin == "LIVE" else origin)).upper()
             if target not in {"LIVE", "PAUSED", "REPLAY"}:
@@ -964,21 +1113,33 @@ class LendingStateStore:
                     RECOVERY_REQUIRED_SNAPSHOTS,
                     started,
                     None,
-                    None if manual_required else now + recovery_delay_seconds(attempts) * 1000,
+                    None if manual_required else now + recovery_delay_seconds(
+                        attempts, network=is_live_network_recovery(category, target),
+                    ) * 1000,
                     str(reason),
                     int(bool(manual_required)),
                 ),
             )
         return self.recovery_status()
 
-    def record_recovery_failure(self, error_text, category=None, now_ms=None):
+    def record_recovery_failure(self, error_text, category=None, now_ms=None, *,
+                                expected_started_at=None):
         now = int(now_ms if now_ms is not None else self._now_ms())
         with self.transaction(immediate=True) as connection:
             row = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
-            if not row["active"] or row["manual_required"]:
+            if (not row["active"] or row["manual_required"]
+                    or (expected_started_at is not None and row["started_at_ms"] != expected_started_at)):
                 return self._recovery_payload(row)
             attempts = int(row["attempts"] or 0) + 1
-            delay = recovery_delay_seconds(attempts - 1)
+            # A later transport error must not bypass the checks imposed by a
+            # previous account, rate-limit or ambiguous-write failure.
+            if category in (None, "NETWORK_TRANSPORT"):
+                category = row["category"] or category
+            minimum_delay = (max(60, getattr(error_text, "retry_after_seconds", 0))
+                             if getattr(error_text, "status_code", None) == 429 else 0)
+            delay = max(minimum_delay, recovery_delay_seconds(
+                attempts - 1, network=is_live_network_recovery(category, row["target_mode"]),
+            ))
             connection.execute(
                 """UPDATE recovery_state SET category=COALESCE(?, category), attempts=?,
                    successful_snapshots=0, last_probe_at_ms=?, next_probe_at_ms=?,
@@ -986,6 +1147,19 @@ class LendingStateStore:
                 (category, attempts, now, now + delay * 1000, str(error_text)),
             )
         return self.recovery_status()
+
+    def expedite_network_probe(self, started_at_ms, offer_updated_at_ms, now_ms):
+        with self.transaction(immediate=True) as connection:
+            return bool(connection.execute(
+                """UPDATE recovery_state SET next_probe_at_ms=? WHERE singleton=1 AND active=1
+                   AND started_at_ms=? AND started_at_ms<=? AND category='NETWORK_TRANSPORT'
+                   AND target_mode='LIVE' AND manual_required=0 AND successful_snapshots=0
+                   AND next_probe_at_ms>? AND EXISTS (SELECT 1 FROM runtime_state
+                       WHERE singleton=1 AND mode='PAUSED' AND safe_manual=0)
+                   AND NOT EXISTS (SELECT 1 FROM order_intents
+                       WHERE state IN ('PLANNED','SUBMITTING','AMBIGUOUS'))""",
+                (now_ms, started_at_ms, offer_updated_at_ms, now_ms),
+            ).rowcount)
 
     def recovery_probe_due(self, now_ms=None):
         now = int(now_ms if now_ms is not None else self._now_ms())
@@ -997,28 +1171,34 @@ class LendingStateStore:
             and (row["next_probe_at_ms"] is None or now >= int(row["next_probe_at_ms"]))
         )
 
-    def record_recovery_snapshot(self, now_ms=None):
+    def record_recovery_snapshot(self, now_ms=None, *, expected_started_at=None, probe_started_at=None):
         now = int(now_ms if now_ms is not None else self._now_ms())
         resumed = False
         with self.transaction(immediate=True) as connection:
             row = connection.execute("SELECT * FROM recovery_state WHERE singleton=1").fetchone()
-            if not row["active"] or row["manual_required"]:
+            runtime = connection.execute("SELECT mode, safe_manual FROM runtime_state WHERE singleton=1").fetchone()
+            if (not row["active"] or row["manual_required"] or runtime["safe_manual"]
+                    or (expected_started_at is not None and row["started_at_ms"] != expected_started_at)):
                 return {"resumed": False, "recovery": self._recovery_payload(row)}
             last = row["last_probe_at_ms"]
             count = int(row["successful_snapshots"] or 0)
-            if last is None or now - int(last) >= RECOVERY_MINIMUM_GAP_MS:
-                count += 1
+            required = int(row["required_snapshots"] or RECOVERY_REQUIRED_SNAPSHOTS)
+            network = is_live_network_recovery(row["category"], row["target_mode"])
+            gap = NETWORK_RECOVERY_MINIMUM_GAP_MS if network else RECOVERY_MINIMUM_GAP_MS
+            probe_started = now if probe_started_at is None else probe_started_at
+            counted = last is None or (network and not count) or probe_started - int(last) >= gap
+            if counted:
+                count = min(count + 1, required)
                 connection.execute(
                     """UPDATE recovery_state SET successful_snapshots=?, last_probe_at_ms=?,
                        next_probe_at_ms=?, last_error=NULL WHERE singleton=1""",
-                    (count, now, now + RECOVERY_MINIMUM_GAP_MS),
+                    (count, now, now + gap),
                 )
             unresolved = connection.execute(
                 "SELECT COUNT(*) FROM order_intents WHERE state IN ('PLANNED','SUBMITTING','AMBIGUOUS')"
             ).fetchone()[0]
-            if count >= int(row["required_snapshots"] or RECOVERY_REQUIRED_SNAPSHOTS) and not unresolved:
+            if counted and count >= required and not unresolved:
                 target = row["target_mode"] if row["target_mode"] in {"LIVE", "PAUSED", "REPLAY"} else "PAUSED"
-                current_mode = connection.execute("SELECT mode FROM runtime_state WHERE singleton=1").fetchone()[0]
                 connection.execute(
                     """UPDATE runtime_state SET mode=?, previous_mode=NULL, safe_reason=NULL,
                        safe_manual=0, consistent_syncs=0, last_consistent_sync_ms=NULL,
@@ -1027,7 +1207,7 @@ class LendingStateStore:
                 )
                 connection.execute(
                     "INSERT INTO mode_events(from_mode,to_mode,reason,created_at_ms) VALUES(?,?,?,?)",
-                    (current_mode, target, "automatic recovery confirmed", now),
+                    (runtime["mode"], target, "automatic recovery confirmed", now),
                 )
                 connection.execute(
                     """UPDATE recovery_state SET active=0, successful_snapshots=0,
@@ -1136,8 +1316,8 @@ class LendingStateStore:
         now = int(now_ms if now_ms is not None else self._now_ms())
         recovery = self.recovery_status()
         if recovery["active"]:
-            result = self.record_recovery_snapshot(now)
-            return self.runtime() if result["resumed"] else self.runtime()
+            self.record_recovery_snapshot(now)
+            return self.runtime()
         with self.transaction(immediate=True) as connection:
             row = connection.execute("SELECT * FROM runtime_state WHERE singleton = 1").fetchone()
             if (
@@ -1478,50 +1658,15 @@ class LendingStateStore:
         period = None if selected_period is None else int(selected_period)
         score_rows = scores or []
         serialized = json.dumps(score_rows, ensure_ascii=False, sort_keys=True, default=str)
-        score_by_period = {
-            int(row["period"]): D(row.get("totalScore") or 0)
-            for row in score_rows
-            if row.get("period") is not None and row.get("eligible", True)
-        }
         with self.transaction(immediate=True) as connection:
             previous = connection.execute(
                 """SELECT * FROM period_selection_state
                    WHERE strategy_version=? AND pool=?""",
                 (version, pool),
             ).fetchone()
-            active = None if previous is None else previous["selected_period"]
-            selected_since = (
-                now if previous is None or previous["selected_since_ms"] is None else int(previous["selected_since_ms"])
+            transition = period_selection_transition(
+                previous, period, score_rows, now, advantage=advantage, hold_ms=hold_ms,
             )
-            challenger = None
-            challenger_since = None
-            promoted = False
-            if period is None:
-                active = None
-                selected_since = now
-            elif previous is None or active is None:
-                active = period
-                selected_since = now
-            elif int(active) != period:
-                old_score = score_by_period.get(int(active))
-                new_score = score_by_period.get(period)
-                qualifies = new_score is not None and (
-                    old_score is None or (new_score > old_score and new_score >= old_score * (D("1") + D(advantage)))
-                )
-                if qualifies:
-                    previous_challenger = previous["challenger_period"]
-                    challenger = period
-                    challenger_since = (
-                        int(previous["challenger_since_ms"])
-                        if previous_challenger == period and previous["challenger_since_ms"] is not None
-                        else now
-                    )
-                    if now - challenger_since >= int(hold_ms):
-                        active = period
-                        selected_since = now
-                        challenger = None
-                        challenger_since = None
-                        promoted = True
             connection.execute(
                 """INSERT INTO period_selection_state(
                        strategy_version, pool, selected_period, selected_since_ms,
@@ -1537,24 +1682,26 @@ class LendingStateStore:
                 (
                     version,
                     pool,
-                    active,
-                    selected_since,
+                    transition["selected_period"],
+                    transition["selected_since_ms"],
                     serialized,
                     now,
-                    challenger,
-                    challenger_since,
+                    transition["challenger_period"],
+                    transition["challenger_since_ms"],
                 ),
             )
         return {
             "strategyVersion": version,
             "pool": pool,
-            "selectedPeriod": None if active is None else int(active),
-            "selectedSinceMs": selected_since,
+            "selectedPeriod": transition["selected_period"],
+            "selectedSinceMs": transition["selected_since_ms"],
             "leaderPeriod": period,
-            "challengerPeriod": challenger,
-            "challengerSinceMs": challenger_since,
-            "challengerDurationMs": 0 if challenger_since is None else max(0, now - challenger_since),
-            "promoted": promoted,
+            "challengerPeriod": transition["challenger_period"],
+            "challengerSinceMs": transition["challenger_since_ms"],
+            "challengerDurationMs": (
+                0 if transition["challenger_since_ms"] is None else max(0, now - transition["challenger_since_ms"])
+            ),
+            "promoted": transition["promoted"],
             "updatedAtMs": now,
         }
 
@@ -1571,20 +1718,15 @@ class LendingStateStore:
         """Confirm a low-demand signal only across distinct five-minute buckets."""
 
         now = int(now_ms if now_ms is not None else self._now_ms())
-        cycle = now // 300_000
         with self.transaction(immediate=True) as connection:
             previous = connection.execute(
                 """SELECT * FROM demand_confirmation_state
                    WHERE strategy_version=? AND scope=? AND signal_key=?""",
                 (str(strategy_version), str(scope), str(signal_key)),
             ).fetchone()
-            count = 0 if previous is None else int(previous["consecutive_cycles"] or 0)
-            last_cycle = None if previous is None else previous["last_cycle"]
-            if below_threshold is None or not bool(below_threshold):
-                count = 0
-            elif last_cycle != cycle:
-                count = count + 1 if last_cycle == cycle - 1 else 1
-            confirmed = bool(count >= int(required_cycles))
+            transition = demand_confirmation_transition(
+                previous, below_threshold, now, required_cycles=required_cycles,
+            )
             connection.execute(
                 """INSERT INTO demand_confirmation_state(
                        strategy_version, scope, signal_key, consecutive_cycles,
@@ -1600,14 +1742,15 @@ class LendingStateStore:
                     str(strategy_version),
                     str(scope),
                     str(signal_key),
-                    count,
-                    int(confirmed),
-                    cycle,
+                    transition["consecutive_cycles"],
+                    int(transition["confirmed"]),
+                    transition["last_cycle"],
                     None if share is None else _decimal_text(share),
                     now,
                 ),
             )
-        return {"cycles": count, "confirmed": confirmed, "cycle": cycle}
+        return {"cycles": transition["consecutive_cycles"], "confirmed": transition["confirmed"],
+                "cycle": transition["last_cycle"]}
 
     def consolidation_status(self):
         with self.read_connection() as connection:
@@ -1748,7 +1891,8 @@ class LendingStateStore:
                     """SELECT key, value FROM schema_meta WHERE key IN (
                            'release_0.3.5_activated_at_ms',
                            'release_0.3.5_boundary_source',
-                           'release_0.3.5_boundary_evidence_at_ms'
+                           'release_0.3.5_boundary_evidence_at_ms',
+                           'release_0.3.6_activated_at_ms'
                        )"""
                 ).fetchall()
             }
@@ -1757,10 +1901,35 @@ class LendingStateStore:
         return {
             "version": CURRENT_RELEASE,
             "label": CURRENT_RELEASE_LABEL,
+            "baselineVersion": "0.3.5.2",
+            "baselineLabel": "V3.5",
+            "v36ActivatedAtMs": (
+                None if rows.get("release_0.3.6_activated_at_ms") is None
+                else int(rows["release_0.3.6_activated_at_ms"])
+            ),
             "activatedAtMs": None if activated is None else int(activated),
             "boundarySource": rows.get("release_0.3.5_boundary_source"),
             "evidenceAtMs": None if evidence is None else int(evidence),
         }
+
+    def record_v36_activation(self, details=None, now_ms=None):
+        """Record the cutover only after a validated live configuration activates."""
+        now = int(self._now_ms() if now_ms is None else now_ms)
+        with self.transaction(immediate=True) as connection:
+            existing = connection.execute(
+                "SELECT value FROM schema_meta WHERE key='release_0.3.6_activated_at_ms'"
+            ).fetchone()
+            if existing is not None:
+                return int(existing["value"])
+            connection.execute(
+                "INSERT INTO schema_meta(key,value) VALUES('release_0.3.6_activated_at_ms',?)", (str(now),)
+            )
+            connection.execute(
+                """INSERT INTO strategy_events(event_type,from_version,to_version,reason,created_at_ms)
+                   VALUES('V36_ACTIVATED','0.3.5.2',?,?,?)""",
+                (CURRENT_RELEASE, json.dumps(details or {}, ensure_ascii=False, sort_keys=True, default=str), now),
+            )
+        return now
 
     @staticmethod
     def _funding_wait_records(connection, currency, since_ms, until_ms):
@@ -2102,13 +2271,16 @@ class LendingStateStore:
         return self.intent(intent_id)
 
     def confirm_intent(self, intent_id, exchange_offer_id):
-        return self._set_intent_state(
+        result = self._set_intent_state(
             intent_id,
             "CONFIRMED",
             int(exchange_offer_id),
             write_phase="CONFIRMED",
             resolution="EXCHANGE_CONFIRMED",
         )
+        with self.transaction(immediate=True) as connection:
+            self._clear_confirmed_submit_protection(connection, int(exchange_offer_id), int(intent_id), self._now_ms())
+        return result
 
     def mark_ambiguous(self, intent_id, error_text):
         self._set_intent_state(
@@ -2185,6 +2357,7 @@ class LendingStateStore:
                        resolved_at_ms=?, updated_at_ms=? WHERE id=?""",
                     (int(exchange_offer_id), now, now, int(intent_id)),
                 )
+                self._clear_confirmed_submit_protection(connection, int(exchange_offer_id), int(intent_id), now)
             else:
                 connection.execute(
                     """UPDATE order_intents SET state='CLOSED', error_text='operator confirmed absent',
@@ -2344,6 +2517,7 @@ class LendingStateStore:
                         offer_id,
                     ),
                 )
+                self._clear_confirmed_submit_protection(connection, offer_id, intent["id"], now)
                 resolved.append({"intentId": intent["id"], "offerId": offer_id})
             remaining = connection.execute("SELECT * FROM order_intents WHERE state='AMBIGUOUS' ORDER BY id").fetchall()
             runtime = connection.execute("SELECT * FROM runtime_state WHERE singleton=1").fetchone()
@@ -2417,32 +2591,6 @@ class LendingStateStore:
             ).fetchone()
         return None if row is None else {**dict(row), "result": json.loads(row["result_json"])}
 
-    def set_rollout(self, candidate_version, candidate_share, status="ACTIVE", reason=""):
-        share = int(candidate_share)
-        if share not in {0, 10, 25, 50, 100}:
-            raise StateStoreError("candidate share must be one of 0, 10, 25, 50, 100")
-        now = self._now_ms()
-        with self.transaction(immediate=True) as connection:
-            connection.execute(
-                """INSERT INTO strategy_rollouts(
-                       candidate_version, candidate_share, stage_started_at_ms, status, last_reason
-                   ) VALUES(?, ?, ?, ?, ?)
-                   ON CONFLICT(candidate_version) DO UPDATE SET
-                       candidate_share=excluded.candidate_share,
-                       stage_started_at_ms=excluded.stage_started_at_ms,
-                       status=excluded.status, last_reason=excluded.last_reason""",
-                (str(candidate_version), share, now, str(status), str(reason)),
-            )
-        return self.rollout(candidate_version)
-
-    def rollout(self, candidate_version):
-        with self.read_connection() as connection:
-            row = connection.execute(
-                "SELECT * FROM strategy_rollouts WHERE candidate_version=?",
-                (str(candidate_version),),
-            ).fetchone()
-        return None if row is None else dict(row)
-
     def replenishment_slice_key(self, base_key):
         base_key = str(base_key)
         with self.read_connection() as connection:
@@ -2480,11 +2628,13 @@ class LendingStateStore:
             policy = json.loads(row["policy_json"])
             field = (
                 f"quick_{pool}_reprice_stages_minutes"
-                if layer == "quick" and pricing_curve_version == EXACT_TERM_EXPLORATION_CURVE
+                if layer == "quick" and pricing_curve_version in {EXACT_TERM_EXPLORATION_CURVE, QUICK_EXECUTION_CURVE}
                 else f"{pool}_reprice_stages_minutes"
             )
             stages = policy.get(field)
-            if stages is None and layer == "quick" and pricing_curve_version == EXACT_TERM_EXPLORATION_CURVE:
+            if stages is None and layer == "quick" and pricing_curve_version in {
+                EXACT_TERM_EXPLORATION_CURVE, QUICK_EXECUTION_CURVE,
+            }:
                 # A pre-0.3.5.2 ACTIVE policy can create V4 orders after the
                 # application upgrade even though its raw JSON predates the
                 # quick-stage fields. Parsed runtime policy supplies the V4
@@ -2508,10 +2658,10 @@ class LendingStateStore:
         mapped_floor = (old_floor_stage * new_market + old_market - 1) // old_market
         return min(int(new_stage_count), new_market + mapped_floor)
 
-    def ensure_reprice_chain(self, offer, strategy_version, now_ms=None):
+    def ensure_reprice_chain(self, offer, strategy_version, now_ms=None, *, frr_daily_rate=None):
         offer_id = int(offer.get("offer_id") or offer.get("id"))
         now = int(now_ms if now_ms is not None else self._now_ms())
-        observed_rate = _decimal_text(offer.get("rate_real") or offer["rate"])
+        observed_rate = funding_offer_effective_rate(offer, frr_daily_rate)
         started_at = int(offer.get("mts_created") or now)
         with self.transaction(immediate=True) as connection:
             bound = connection.execute(
@@ -2543,6 +2693,8 @@ class LendingStateStore:
                     (offer_id, str(strategy_version)),
                 ).fetchone()
                 if predecessor is None:
+                    if observed_rate is None:
+                        return None
                     connection.execute(
                         """INSERT INTO reprice_chains(
                                chain_key, strategy_version, base_slice_key, pool, layer,
@@ -2555,7 +2707,7 @@ class LendingStateStore:
                             base_key,
                             str(offer.get("pool") or intent["pool"]),
                             str(offer.get("layer") or intent["layer"]),
-                            observed_rate,
+                            _decimal_text(observed_rate),
                             started_at,
                             offer_id,
                             intent["fixed_landing_rate"],
@@ -2923,6 +3075,13 @@ class LendingStateStore:
         with self.transaction(immediate=True) as connection:
             for offer in offers or []:
                 offer_id = int(offer["id"])
+                if "amount_original" not in offer:
+                    prior = connection.execute(
+                        "SELECT amount_original FROM offers WHERE offer_id=?", (offer_id,)
+                    ).fetchone()
+                    if prior:
+                        offer = dict(offer, amount_original=prior["amount_original"])
+                self._observe_manual_offer(connection, offer, seen_at)
                 ids.append(offer_id)
                 intent = connection.execute(
                     "SELECT * FROM order_intents WHERE exchange_offer_id = ?", (offer_id,)
@@ -2951,9 +3110,11 @@ class LendingStateStore:
                     ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(offer_id) DO UPDATE SET amount=excluded.amount, rate=excluded.rate,
                         rate_real=excluded.rate_real, status=excluded.status, flags=excluded.flags,
-                        managed=MAX(offers.managed, excluded.managed), pool=COALESCE(offers.pool, excluded.pool),
+                        amount_original=excluded.amount_original, period=excluded.period,
+                        offer_type=excluded.offer_type,
+                        managed=MAX(offers.managed, excluded.managed), pool=COALESCE(excluded.pool, offers.pool),
                         layer=COALESCE(offers.layer, excluded.layer),
-                        display_type=COALESCE(offers.display_type, excluded.display_type),
+                        display_type=COALESCE(excluded.display_type, offers.display_type),
                         plan_hash=COALESCE(offers.plan_hash, excluded.plan_hash), mts_updated=excluded.mts_updated,
                         strategy_variant=CASE WHEN excluded.managed=1 THEN excluded.strategy_variant
                                               ELSE offers.strategy_variant END,
@@ -2997,6 +3158,10 @@ class LendingStateStore:
                     "UPDATE order_intents SET state='CLOSED', updated_at_ms=? WHERE state='CONFIRMED'",
                     (seen_at,),
                 )
+        with self.transaction(immediate=True) as connection:
+            connection.execute("""UPDATE manual_offer_protection SET state='CLOSED',updated_at_ms=?
+                WHERE state!='CLOSED' AND offer_id IN (SELECT offer_id FROM offers WHERE status='CLOSED')""",
+                               (seen_at,))
         return self.offers(active_only=True)
 
     def offers(self, active_only=False):
@@ -3004,13 +3169,23 @@ class LendingStateStore:
         with self.read_connection() as connection:
             return [dict(row) for row in connection.execute(query).fetchall()]
 
-    def adopt_external_offers(self, offers, strategy_version):
+    def adopt_external_offers(self, offers, strategy_version, now_ms=None, safety_reason=None):
         """Persist explicit preflight-approved ownership without touching the exchange."""
+        allowed = {"disabled_type", "hidden_disabled", "period_not_allowed", "below_new_floor", "funding_cap_exceeded"}
+        if safety_reason and not set(safety_reason.split("+")).issubset(allowed):
+            raise ValueError("unsupported manual protection override")
         adopted = []
-        now = self._now_ms()
+        now = self._now_ms() if now_ms is None else int(now_ms)
         with self.transaction(immediate=True) as connection:
             normalized = {int(value.get("id") or value.get("offer_id")): value for value in offers or []}
             for raw_id in sorted(normalized):
+                protection = self._observe_manual_offer(connection, normalized[raw_id], now)
+                confirmed = connection.execute(
+                    "SELECT state FROM external_takeover_state WHERE offer_id=?", (raw_id,)
+                ).fetchone()
+                if ((protection and protection["protected"] and not safety_reason)
+                        or not confirmed or confirmed["state"] != 'CONFIRMED'):
+                    continue
                 offer = connection.execute(
                     "SELECT * FROM offers WHERE offer_id=? AND status!='CLOSED'", (raw_id,)
                 ).fetchone()
@@ -3386,7 +3561,7 @@ class LendingStateStore:
                         offer_id, currency, amount, rate, period, offer_type, flags, status,
                         managed, pool, layer, mts_created, last_seen_ms
                     ) VALUES(?, ?, '0', '0', 2, ?, 0, 'LEGACY_PENDING_SYNC', 1, ?, ?, ?, ?)
-                    ON CONFLICT(offer_id) DO UPDATE SET managed=1, pool=COALESCE(offers.pool, excluded.pool),
+                    ON CONFLICT(offer_id) DO UPDATE SET managed=1, pool=COALESCE(excluded.pool, offers.pool),
                         layer=COALESCE(offers.layer, excluded.layer)""",
                     (
                         offer_id,
@@ -3507,25 +3682,220 @@ class LendingStateStore:
                     ),
                 )
 
-    def upsert_market_trades(self, trades):
-        rows = [
-            (
-                str(trade["id"]),
-                int(trade["mts"]),
-                _decimal_text(abs(D(trade["amount"]))),
-                _decimal_text(trade["rate"]),
-                int(trade["period"]),
+    def upsert_market_trades(self, trades, *, defer_if_busy=False):
+        """Ingest a batch exactly once, atomically marking changed minute bins.
+
+        Positive legacy ``amount`` values do not prove trade direction.  Only
+        an explicitly supplied raw signed value (or a still-negative amount)
+        can fill that field; a later duplicate may enrich an unknown direction.
+        """
+        rows_by_id = {}
+        for trade in trades or []:
+            amount = D(trade["amount"])
+            raw = trade.get("raw_signed_amount")
+            if raw is None and amount < 0:
+                raw = amount
+            row = (
+                str(trade["id"]), int(trade["mts"]), _decimal_text(abs(amount)),
+                _decimal_text(trade["rate"]), int(trade["period"]),
+                None if raw is None else _decimal_text(raw),
             )
-            for trade in (trades or [])
-        ]
-        if not rows:
-            return
-        with self.transaction(immediate=True) as connection:
-            connection.executemany(
-                """INSERT OR IGNORE INTO market_trades(trade_id, mts, amount, rate, period)
-                   VALUES(?, ?, ?, ?, ?)""",
-                rows,
-            )
+            previous = rows_by_id.get(row[0])
+            if previous is None or (previous[5] is None and row[5] is not None):
+                rows_by_id[row[0]] = row
+        if not rows_by_id:
+            return {"inserted": 0, "updated": 0, "sourceSequence": self.market_source_sequence(), "deferred": False}
+        try:
+            with self.transaction(immediate=True, timeout_seconds=0.05 if defer_if_busy else None) as connection:
+                existing = {}
+                ids = list(rows_by_id)
+                for offset in range(0, len(ids), 500):
+                    chunk = ids[offset:offset + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    existing.update({
+                        row["trade_id"]: row for row in connection.execute(
+                            "SELECT trade_id,mts,raw_signed_amount FROM market_trades "
+                            f"WHERE trade_id IN ({placeholders})",
+                            chunk,
+                        )
+                    })
+                changed = [
+                    row for key, row in rows_by_id.items()
+                    if key not in existing or (existing[key]["raw_signed_amount"] is None and row[5] is not None)
+                ]
+                sequence = int(connection.execute(
+                    "SELECT value FROM schema_meta WHERE key='market_source_sequence'"
+                ).fetchone()[0])
+                inserted = sum(row[0] not in existing for row in changed)
+                if changed:
+                    sequence += 1
+                    connection.executemany(
+                        """INSERT INTO market_trades(
+                               trade_id,mts,amount,rate,period,raw_signed_amount,source_sequence
+                           ) VALUES(?,?,?,?,?,?,?)
+                           ON CONFLICT(trade_id) DO UPDATE SET
+                               raw_signed_amount=excluded.raw_signed_amount,
+                               source_sequence=excluded.source_sequence
+                           WHERE market_trades.raw_signed_amount IS NULL
+                             AND excluded.raw_signed_amount IS NOT NULL""",
+                        [(*row, sequence) for row in changed],
+                    )
+                    minutes = {
+                        (existing[row[0]]["mts"] if row[0] in existing else row[1]) // 60_000 * 60_000
+                        for row in changed
+                    }
+                    connection.executemany(
+                        """INSERT INTO market_dirty_minutes(minute_ms,source_sequence) VALUES(?,?)
+                           ON CONFLICT(minute_ms) DO UPDATE SET source_sequence=excluded.source_sequence""",
+                        [(minute, sequence) for minute in sorted(minutes)],
+                    )
+                    connection.execute(
+                        "UPDATE schema_meta SET value=? WHERE key='market_source_sequence'", (str(sequence),)
+                    )
+                return {
+                    "inserted": inserted, "updated": len(changed) - inserted,
+                    "sourceSequence": sequence, "deferred": False,
+                }
+        except sqlite3.OperationalError as error:
+            if not defer_if_busy or not any(word in str(error).lower() for word in ("busy", "locked")):
+                raise
+            return {"inserted": 0, "updated": 0, "sourceSequence": None, "deferred": True}
+
+    @staticmethod
+    def _market_trade_dict(row):
+        return {
+            "id": row["trade_id"], "mts": row["mts"], "amount": D(row["amount"]),
+            "rate": D(row["rate"]), "period": row["period"],
+            "raw_signed_amount": None if row["raw_signed_amount"] is None else D(row["raw_signed_amount"]),
+            "sourceSequence": row["source_sequence"],
+        }
+
+    def iter_market_trades(self, start_ms=0, end_ms=None, batch_size=2000):
+        """Stream individual raw records from one consistent half-open window."""
+        if int(batch_size) <= 0:
+            raise ValueError("batch_size must be positive")
+        query = "SELECT * FROM market_trades WHERE mts>=?"
+        params = [int(start_ms)]
+        if end_ms is not None:
+            query += " AND mts<?"
+            params.append(int(end_ms))
+        query += " ORDER BY mts,trade_id"
+        with self.read_connection() as connection:
+            connection.execute("BEGIN")
+            cursor = connection.execute(query, params)
+            while True:
+                rows = cursor.fetchmany(int(batch_size))
+                if not rows:
+                    break
+                for row in rows:
+                    yield self._market_trade_dict(row)
+
+    def market_source_sequence(self):
+        with self.read_connection() as connection:
+            return int(connection.execute(
+                "SELECT value FROM schema_meta WHERE key='market_source_sequence'"
+            ).fetchone()[0])
+
+    def dirty_market_minutes(self, since_sequence=0, start_ms=0, end_ms=None):
+        query = "SELECT minute_ms,source_sequence FROM market_dirty_minutes WHERE source_sequence>? AND minute_ms>=?"
+        params = [int(since_sequence), int(start_ms) // 60_000 * 60_000]
+        if end_ms is not None:
+            query += " AND minute_ms<?"
+            params.append(int(end_ms))
+        query += " ORDER BY minute_ms"
+        with self.read_connection() as connection:
+            return [
+                {"minuteMs": row["minute_ms"], "minute_ms": row["minute_ms"],
+                 "sourceSequence": row["source_sequence"]}
+                for row in connection.execute(query, params)
+            ]
+
+    def record_market_coverage(self, start_ms, end_ms, status="COMPLETE", source="REST", details=None,
+                               *, defer_if_busy=False):
+        """Record proven traversal of [start,end), including verified empty spans.
+
+        Merely receiving trades never creates coverage.  Failed/ambiguous REST
+        intervals remain visible until a later complete traversal proves them.
+        """
+        start, end = int(start_ms), int(end_ms)
+        if end < start:
+            raise ValueError("coverage end must be at or after start")
+        state = str(status).upper()
+        try:
+            with self.transaction(immediate=True, timeout_seconds=0.05 if defer_if_busy else None) as connection:
+                cursor = connection.execute(
+                    """INSERT INTO market_coverage_intervals(
+                           start_ms,end_ms,status,source,details_json,recorded_at_ms
+                       ) VALUES(?,?,?,?,?,?)""",
+                    (start, end, state, str(source),
+                     None if details is None else json.dumps(details, ensure_ascii=False, sort_keys=True, default=str),
+                     self._now_ms()),
+                )
+                connection.execute(
+                    "UPDATE schema_meta SET value=CAST(value AS INTEGER)+1 WHERE key='market_source_sequence'"
+                )
+                return {"id": cursor.lastrowid, "deferred": False}
+        except sqlite3.OperationalError as error:
+            if not defer_if_busy or not any(word in str(error).lower() for word in ("busy", "locked")):
+                raise
+            return {"id": None, "deferred": True}
+
+    def market_coverage(self, start_ms, end_ms):
+        start, end = int(start_ms), int(end_ms)
+        if end < start:
+            raise ValueError("coverage end must be at or after start")
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM market_coverage_intervals
+                   WHERE start_ms<? AND end_ms>? ORDER BY start_ms,id""", (end, start),
+            ).fetchall()
+        merged = []
+        for row in rows:
+            if row["status"] != "COMPLETE":
+                continue
+            left, right = max(start, row["start_ms"]), min(end, row["end_ms"])
+            if right <= left:
+                continue
+            if merged and left <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], right)
+            else:
+                merged.append([left, right])
+
+        def interval(left, right, status):
+            return {"startMs": left, "endMs": right, "start_ms": left, "end_ms": right, "status": status}
+
+        unresolved = []
+        cursor = start
+        gaps = []
+        for left, right in merged:
+            if cursor < left:
+                gaps.append((cursor, left))
+            cursor = right
+        if cursor < end:
+            gaps.append((cursor, end))
+        failures = [row for row in rows if row["status"] != "COMPLETE"]
+        for left, right in gaps:
+            relevant = [row for row in failures if row["start_ms"] < right and row["end_ms"] > left]
+            boundaries = sorted({left, right, *(
+                boundary for row in relevant for boundary in
+                (max(left, row["start_ms"]), min(right, row["end_ms"]))
+            )})
+            for section_start, section_end in zip(boundaries, boundaries[1:]):
+                latest = max(
+                    (row for row in relevant if row["start_ms"] <= section_start and row["end_ms"] >= section_end),
+                    key=lambda row: row["id"], default=None,
+                )
+                state = "UNVERIFIED" if latest is None else latest["status"]
+                if unresolved and unresolved[-1]["endMs"] == section_start and unresolved[-1]["status"] == state:
+                    unresolved[-1]["endMs"] = unresolved[-1]["end_ms"] = section_end
+                else:
+                    unresolved.append(interval(section_start, section_end, state))
+        covered = [interval(left, right, "COMPLETE") for left, right in merged]
+        return {
+            "complete": not unresolved, "coveredDurationMs": sum(right - left for left, right in merged),
+            "coveredIntervals": covered, "unresolvedIntervals": unresolved,
+            "intervals": covered, "unresolved": unresolved,
+        }
 
     def upsert_funding_stats(self, stats):
         with self.transaction(immediate=True) as connection:
@@ -3559,16 +3929,26 @@ class LendingStateStore:
             rows = connection.execute(query, tuple(params)).fetchall()
         return [json.loads(row["payload_json"]) for row in rows]
 
-    def record_book_snapshot(self, book, source="REST", now_ms=None):
+    def record_book_snapshot(self, book, source="REST", now_ms=None, *, defer_if_busy=False):
         now = int(now_ms if now_ms is not None else self._now_ms())
         bucket = now - (now % 60_000)
         payload = json.dumps(book or [], ensure_ascii=False, sort_keys=True, default=str)
-        with self.transaction(immediate=True) as connection:
-            connection.execute(
-                """INSERT OR REPLACE INTO book_snapshots(mts, source, book_json)
-                   VALUES(?, ?, ?)""",
-                (bucket, str(source), payload),
-            )
+        try:
+            with self.transaction(immediate=True, timeout_seconds=0.05 if defer_if_busy else None) as connection:
+                connection.execute(
+                    """INSERT INTO book_snapshots(mts, source, book_json, observed_at_ms)
+                       VALUES(?, ?, ?, ?)
+                       ON CONFLICT(mts) DO UPDATE SET source=excluded.source,
+                           book_json=excluded.book_json, observed_at_ms=excluded.observed_at_ms
+                       WHERE book_snapshots.observed_at_ms IS NULL
+                          OR excluded.observed_at_ms >= book_snapshots.observed_at_ms""",
+                    (bucket, str(source), payload, now),
+                )
+        except sqlite3.OperationalError as error:
+            if not defer_if_busy or not any(word in str(error).lower() for word in ("busy", "locked")):
+                raise
+            return False
+        return True
 
     def book_snapshots(self, start_ms=0, end_ms=None):
         query = "SELECT * FROM book_snapshots WHERE mts >= ?"
@@ -3579,7 +3959,47 @@ class LendingStateStore:
         query += " ORDER BY mts"
         with self.read_connection() as connection:
             rows = connection.execute(query, tuple(params)).fetchall()
-        return [{**dict(row), "book": json.loads(row["book_json"])} for row in rows]
+        return [self._book_snapshot_dict(row) for row in rows]
+
+    @staticmethod
+    def _book_snapshot_dict(row):
+        return {
+            **dict(row), "book": json.loads(row["book_json"]),
+            "visible_at_ms": row["observed_at_ms"] if row["observed_at_ms"] is not None else row["mts"] + 60_000,
+        }
+
+    def iter_book_snapshots(self, start_ms=0, end_ms=None, batch_size=200):
+        """Stream books when they became visible, never at an earlier bucket."""
+        if int(batch_size) <= 0:
+            raise ValueError("batch_size must be positive")
+        query = "SELECT * FROM book_snapshots WHERE COALESCE(observed_at_ms,mts+60000)>=?"
+        params = [int(start_ms)]
+        if end_ms is not None:
+            query += " AND COALESCE(observed_at_ms,mts+60000)<?"
+            params.append(int(end_ms))
+        query += " ORDER BY COALESCE(observed_at_ms,mts+60000),mts"
+        with self.read_connection() as connection:
+            connection.execute("BEGIN")
+            cursor = connection.execute(query, params)
+            while True:
+                rows = cursor.fetchmany(int(batch_size))
+                if not rows:
+                    break
+                for row in rows:
+                    yield self._book_snapshot_dict(row)
+
+    def book_snapshot_coverage(self, start_ms=0, end_ms=None):
+        """Summarize research coverage without loading historical book payloads."""
+        query = (
+            "SELECT COUNT(*) AS count, MIN(mts) AS earliestMs, "
+            "MAX(mts) AS latestMs FROM book_snapshots WHERE mts >= ?"
+        )
+        params = [int(start_ms)]
+        if end_ms is not None:
+            query += " AND mts <= ?"
+            params.append(int(end_ms))
+        with self.read_connection() as connection:
+            return dict(connection.execute(query, tuple(params)).fetchone())
 
     def record_market_bars(self, windows, now_ms=None):
         now = int(now_ms if now_ms is not None else self._now_ms())
@@ -3611,26 +4031,66 @@ class LendingStateStore:
         query += " ORDER BY mts"
         with self.read_connection() as connection:
             rows = connection.execute(query, tuple(params)).fetchall()
-        return [
-            {
-                "id": row["trade_id"],
-                "mts": row["mts"],
-                "amount": D(row["amount"]),
-                "rate": D(row["rate"]),
-                "period": row["period"],
-            }
-            for row in rows
-        ]
+        return [self._market_trade_dict(row) for row in rows]
 
     def prune_market_data(self, retention_days=90, now_ms=None):
         now = int(now_ms if now_ms is not None else self._now_ms())
         threshold = now - int(retention_days) * 86_400_000
+        derived_threshold = max(threshold, now - 8 * 86_400_000)
         with self.transaction(immediate=True) as connection:
             trade_count = connection.execute("DELETE FROM market_trades WHERE mts < ?", (threshold,)).rowcount
-            bar_count = connection.execute("DELETE FROM market_bars WHERE bucket_ms < ?", (threshold,)).rowcount
+            bar_count = connection.execute(
+                "DELETE FROM market_bars WHERE bucket_ms < ?", (derived_threshold,)
+            ).rowcount
             book_count = connection.execute("DELETE FROM book_snapshots WHERE mts < ?", (threshold,)).rowcount
             stats_count = connection.execute("DELETE FROM funding_stats WHERE mts < ?", (threshold,)).rowcount
+            # Dirty bins are incremental runtime hints, not research evidence.
+            connection.execute(
+                "DELETE FROM market_dirty_minutes WHERE minute_ms < ?", (now - 8 * 86_400_000,)
+            ).rowcount
+            connection.execute(
+                "DELETE FROM market_coverage_intervals WHERE end_ms <= ?", (threshold,)
+            ).rowcount
+            connection.execute(
+                "UPDATE market_coverage_intervals SET start_ms=? WHERE start_ms<? AND end_ms>?",
+                (threshold, threshold, threshold),
+            )
         return {"trades": trade_count, "bars": bar_count, "books": book_count, "stats": stats_count}
+
+    def repayment_calibration(self, start_ms, end_ms):
+        """Return training-visible closed-credit evidence without future rows.
+
+        A history closing timestamp is exchange evidence; snapshot disappearance
+        is labeled separately because it only bounds the actual repayment time.
+        """
+        start, end = int(start_ms), int(end_ms)
+        with self.read_connection() as connection:
+            connection.execute("BEGIN")
+            historical = connection.execute(
+                """SELECT credit_id,amount,period,mts_opening,mts_updated FROM credit_history
+                   WHERE currency='USD' AND UPPER(status) LIKE 'CLOSED%'
+                     AND mts_updated>=? AND mts_updated<?
+                     AND mts_opening IS NOT NULL AND mts_updated>mts_opening""", (start, end),
+            ).fetchall()
+            observed = connection.execute(
+                """SELECT credit_id,amount,period,opened_at_ms,closed_at_ms FROM credit_closures
+                   WHERE currency='USD' AND closed_at_ms>=? AND closed_at_ms<?
+                     AND opened_at_ms IS NOT NULL AND closed_at_ms>opened_at_ms""", (start, end),
+            ).fetchall()
+        results = {
+            row["credit_id"]: {
+                "credit_id": row["credit_id"], "amount": D(row["amount"]), "period": row["period"],
+                "opened_at_ms": row["opened_at_ms"], "closed_at_ms": row["closed_at_ms"],
+                "source": "OBSERVED_CLOSE",
+            } for row in observed
+        }
+        for row in historical:
+            results[row["credit_id"]] = {
+                "credit_id": row["credit_id"], "amount": D(row["amount"]), "period": row["period"],
+                "opened_at_ms": row["mts_opening"], "closed_at_ms": row["mts_updated"],
+                "source": "HISTORY_CLOSED",
+            }
+        return sorted(results.values(), key=lambda row: (row["closed_at_ms"], row["credit_id"]))
 
     def record_account_sample(self, total, wallet, offers, credits, net_interest, mts=None):
         mts = int(mts if mts is not None else self._now_ms())
@@ -3710,7 +4170,8 @@ class LendingStateStore:
             )
         return self.income_sync_state(currency)
 
-    def realized_income(self, currency="USD", start_ms=None, end_ms=None):
+    @staticmethod
+    def _income_rows(connection, currency, start_ms, end_ms):
         clauses = ["currency = ?", "wallet = 'funding'", "category = 28", "CAST(amount AS REAL) > 0"]
         params = [str(currency).upper()]
         if start_ms is not None:
@@ -3719,10 +4180,13 @@ class LendingStateStore:
         if end_ms is not None:
             clauses.append("mts <= ?")
             params.append(int(end_ms))
+        return connection.execute(
+            f"SELECT mts, amount FROM ledger_entries WHERE {' AND '.join(clauses)}", tuple(params)
+        ).fetchall()
+
+    def realized_income(self, currency="USD", start_ms=None, end_ms=None):
         with self.read_connection() as connection:
-            rows = connection.execute(
-                f"SELECT amount FROM ledger_entries WHERE {' AND '.join(clauses)}", tuple(params)
-            ).fetchall()
+            rows = self._income_rows(connection, currency, start_ms, end_ms)
         return sum((D(row["amount"]) for row in rows), D("0"))
 
     def realized_income_summary(self, currency="USD", now_ms=None):
@@ -3760,25 +4224,13 @@ class LendingStateStore:
             "error": state["error"],
         }
 
-    def statistics(self, window_days=None, now_ms=None):
-        now = int(now_ms if now_ms is not None else self._now_ms())
-        start = 0 if window_days is None else now - int(window_days) * 86_400_000
-        with self.read_connection() as connection:
-            connection.execute("BEGIN")
-            rows = connection.execute("SELECT * FROM account_samples WHERE mts >= ? ORDER BY mts", (start,)).fetchall()
-            reprices = connection.execute(
-                "SELECT COUNT(*) AS count FROM reprice_events WHERE created_at_ms >= ?", (start,)
-            ).fetchone()["count"]
-            waits = self._funding_wait_records(connection, "USD", start, now + 1)
-            closures = connection.execute(
-                "SELECT * FROM credit_closures WHERE closed_at_ms >= ? ORDER BY closed_at_ms",
-                (start,),
-            ).fetchall()
+    @staticmethod
+    def _closure_statistics(closures):
         attributed = {}
         early = 0
         for row in closures:
             opened = row["opened_at_ms"] or row["closed_at_ms"]
-            elapsed_days = D(max(0, row["closed_at_ms"] - opened)) / D("86400000")
+            elapsed_days = D(max(0, row["closed_at_ms"] - opened)) / D(DAY_MS)
             contractual_days = D(max(1, row["period"]))
             if elapsed_days + D("0.000001") < contractual_days:
                 early += 1
@@ -3788,54 +4240,116 @@ class LendingStateStore:
             order_type = row["rate_type"] if row["managed"] and row["rate_type"] else "EXTERNAL"
             key = f"{pool}:{order_type}"
             attributed[key] = attributed.get(key, D("0")) + earned
-        details = {
-            **self._funding_wait_summary(waits),
+        return {
             "earlyReturnPercent": _decimal_text(D(early) / D(len(closures)) * D("100")) if closures else "0",
             "closedCreditCount": len(closures),
             "returnsByPoolAndType": {key: _decimal_text(value) for key, value in sorted(attributed.items())},
         }
-        ledger_interest = self.realized_income("USD", None if window_days is None else start, now)
-        if not rows:
-            return {
-                "windowDays": window_days,
-                "sampleFrom": None,
-                "sampleTo": None,
-                "sampleDays": "0",
-                "utilizationPercent": "0",
-                "netInterest": _decimal_text(ledger_interest),
-                "actualNetAprPercent": "0",
-                "idlePrincipalTime": "0",
-                "repriceCount": reprices,
-                **details,
+
+    @staticmethod
+    def _sample_statistics(samples, starts, windows, now):
+        # Walk from newest to oldest once, reusing the running totals at each window boundary.
+        remaining = iter(reversed(samples))
+        row = next(remaining, None)
+        newest = row["mts"] if row is not None else None
+        end = now
+        principal_ms = utilized_ms = idle_ms = observed_principal_ms = observed_utilized_ms = D("0")
+        observed_ms = 0
+        result = {}
+        for key, start in sorted(starts.items(), key=lambda item: item[1], reverse=True):
+            while row is not None and row["mts"] >= start:
+                duration = end - row["mts"]
+                observed = min(duration, ACCOUNT_SAMPLE_MAX_AGE_MS)
+                total = D(row["total_principal"])
+                utilized = D(row["active_credits"])
+                principal = total * duration
+                funded = utilized * duration
+                principal_ms += principal
+                utilized_ms += funded
+                idle_ms += max(D("0"), principal - funded)
+                observed_ms += observed
+                observed_principal_ms += principal if observed == duration else total * observed
+                observed_utilized_ms += funded if observed == duration else utilized * observed
+                end = row["mts"]
+                row = next(remaining, None)
+
+            sample_from = end if newest is not None and newest >= start else None
+            span_start = start if windows[key] is not None else sample_from
+            span_ms = max(0, now - span_start) if span_start is not None else 0
+            # The preceding sample can still cover part of a bounded window.
+            covered = observed_ms
+            covered_principal = observed_principal_ms
+            covered_utilized = observed_utilized_ms
+            if row is not None and windows[key] is not None:
+                overlap = max(0, min(end, row["mts"] + ACCOUNT_SAMPLE_MAX_AGE_MS) - start)
+                if overlap:
+                    covered += overlap
+                    covered_principal += D(row["total_principal"]) * overlap
+                    covered_utilized += D(row["active_credits"]) * overlap
+
+            result[key] = (principal_ms / D(DAY_MS), {
+                "sampleFrom": sample_from,
+                "sampleTo": newest if sample_from is not None else None,
+                "sampleDays": _decimal_text(D(newest - sample_from) / D(DAY_MS)) if sample_from is not None else "0",
+                "utilizationPercent": _decimal_text(utilized_ms / principal_ms * D("100")) if principal_ms > 0 else "0",
+                "idlePrincipalTime": _decimal_text(idle_ms / D(DAY_MS)),
+                "sampleCoveragePercent": _decimal_text(D(covered) / D(span_ms) * D("100")) if span_ms else "0",
+                "observedUtilizationPercent": (
+                    _decimal_text(covered_utilized / covered_principal * D("100")) if covered_principal > 0 else None
+                ),
+            })
+        return result
+
+    def statistics_windows(self, now_ms=None, *, windows=STATISTICS_WINDOWS):
+        now = int(now_ms if now_ms is not None else self._now_ms())
+        starts = {key: 0 if days is None else now - int(days) * DAY_MS for key, days in windows.items()}
+        earliest = min(starts.values())
+        with self.read_connection() as connection:
+            connection.execute("BEGIN")
+            predecessor = connection.execute(
+                "SELECT MAX(mts) FROM account_samples WHERE mts >= ? AND mts < ?",
+                (earliest - ACCOUNT_SAMPLE_MAX_AGE_MS, earliest),
+            ).fetchone()[0]
+            samples = connection.execute(
+                """SELECT mts, total_principal, active_credits FROM account_samples
+                   WHERE mts BETWEEN ? AND ? ORDER BY mts""",
+                (earliest if predecessor is None else predecessor, now),
+            ).fetchall()
+            reprices = [row[0] for row in connection.execute(
+                "SELECT created_at_ms FROM reprice_events WHERE created_at_ms BETWEEN ? AND ? ORDER BY created_at_ms",
+                (earliest, now),
+            )]
+            waits = self._funding_wait_records(connection, "USD", earliest, now + 1)
+            closures = connection.execute(
+                "SELECT * FROM credit_closures WHERE closed_at_ms BETWEEN ? AND ? ORDER BY closed_at_ms",
+                (earliest, now),
+            ).fetchall()
+            ledger = [(row["mts"], D(row["amount"])) for row in self._income_rows(
+                connection, "USD", None if None in windows.values() else earliest, now,
+            )]
+
+        exposures = self._sample_statistics(samples, starts, windows, now)
+        result = {}
+        for key, days in windows.items():
+            start = starts[key]
+            principal_time, sample_fields = exposures[key]
+            interest = sum((amount for mts, amount in ledger if days is None or mts >= start), D("0"))
+            sample_from = sample_fields["sampleFrom"]
+            apr = D("0")
+            if principal_time > 0:
+                apr_interest = sum((amount for mts, amount in ledger if mts >= sample_from), D("0"))
+                apr = apr_interest / principal_time * D("365")
+            result[key] = {
+                "windowDays": days,
+                "calculatedAtMs": now,
+                **sample_fields,
+                "netInterest": _decimal_text(interest),
+                "actualNetAprPercent": _decimal_text(apr * D("100")),
+                "repriceCount": len(reprices) - bisect_left(reprices, start),
+                **self._funding_wait_summary([row for row in waits if row["mts"] >= start]),
+                **self._closure_statistics([row for row in closures if row["closed_at_ms"] >= start]),
             }
-        utilized_time = D("0")
-        principal_time = D("0")
-        idle_time = D("0")
-        for index, row in enumerate(rows):
-            end = rows[index + 1]["mts"] if index + 1 < len(rows) else now
-            duration_days = D(max(0, end - row["mts"])) / D("86400000")
-            total = D(row["total_principal"])
-            utilized = D(row["active_credits"])
-            principal_time += total * duration_days
-            utilized_time += utilized * duration_days
-            idle_time += max(D("0"), total - utilized) * duration_days
-        # APR is estimated only for the period where principal samples exist.
-        # The displayed realized income can cover a wider ledger interval.
-        apr_interest = self.realized_income("USD", max(start, int(rows[0]["mts"])), now)
-        sample_from = int(rows[0]["mts"])
-        sample_to = int(rows[-1]["mts"])
-        sample_days = D(max(0, sample_to - sample_from)) / D("86400000")
-        utilization = D("0") if principal_time <= 0 else utilized_time / principal_time
-        apr = D("0") if principal_time <= 0 else apr_interest / principal_time * D("365")
-        return {
-            "windowDays": window_days,
-            "sampleFrom": sample_from,
-            "sampleTo": sample_to,
-            "sampleDays": _decimal_text(sample_days),
-            "utilizationPercent": _decimal_text(utilization * D("100")),
-            "netInterest": _decimal_text(ledger_interest),
-            "actualNetAprPercent": _decimal_text(apr * D("100")),
-            "idlePrincipalTime": _decimal_text(idle_time),
-            "repriceCount": reprices,
-            **details,
-        }
+        return result
+
+    def statistics(self, window_days=None, now_ms=None):
+        return self.statistics_windows(now_ms, windows={"window": window_days})["window"]

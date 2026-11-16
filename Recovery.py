@@ -12,8 +12,11 @@ from bitfinex import BitfinexAmbiguousWriteError, BitfinexApiError
 
 
 RECOVERY_BACKOFF_SECONDS = (30, 60, 120, 300)
+NETWORK_RECOVERY_BACKOFF_SECONDS = (5, 10, 20, 40, 60, 120)
 RECOVERY_REQUIRED_SNAPSHOTS = 2
 RECOVERY_MINIMUM_GAP_MS = 30_000
+NETWORK_RECOVERY_MINIMUM_GAP_MS = 15_000
+OFFER_RECOVERY_COOLDOWN_MS = 60_000
 WORKER_HEARTBEAT_TIMEOUT_MS = 300_000
 
 
@@ -24,9 +27,14 @@ class RecoveryDecision:
     manual_required: bool = False
 
 
-def recovery_delay_seconds(attempts: int) -> int:
-    index = max(0, min(int(attempts), len(RECOVERY_BACKOFF_SECONDS) - 1))
-    return RECOVERY_BACKOFF_SECONDS[index]
+def is_live_network_recovery(category, target_mode):
+    return category == "NETWORK_TRANSPORT" and target_mode == "LIVE"
+
+
+def recovery_delay_seconds(attempts: int, *, network=False) -> int:
+    schedule = NETWORK_RECOVERY_BACKOFF_SECONDS if network else RECOVERY_BACKOFF_SECONDS
+    index = max(0, min(int(attempts), len(schedule) - 1))
+    return schedule[index]
 
 
 def classify_runtime_error(exc: BaseException) -> RecoveryDecision:
@@ -35,6 +43,8 @@ def classify_runtime_error(exc: BaseException) -> RecoveryDecision:
     if isinstance(exc, BitfinexAmbiguousWriteError):
         return RecoveryDecision("AMBIGUOUS_WRITE", True)
     if isinstance(exc, BitfinexApiError):
+        if exc.status_code == 429:
+            return RecoveryDecision("BITFINEX_HTTP_TRANSIENT", True)
         return RecoveryDecision(getattr(exc, "category", "BITFINEX_API"), True)
     if isinstance(
         exc,

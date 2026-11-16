@@ -602,6 +602,11 @@ details.v3-section:not([open]) .v3-grid { display: none; }
 .v3-plan-summary b { grid-column: 1 / -1; color: #6ad5c7; font-size: 10px; font-weight: 700; }
 .v3-plan-bar { overflow: hidden; height: 5px; background: var(--line); border-radius: 3px; }
 .v3-plan-bar i { display: block; height: 100%; background: var(--accent); }
+.v3-stats-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 9px; }
+.v3-stats-heading h2 { margin: 0; }
+.v3-stats-heading .button { min-height: 34px; padding: 0 10px; font-size: 11px; }
+#v3StatsEmpty, #v3StatsMessage { margin: 0 0 8px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+#v3StatsMessage:empty { display: none; }
 .v3-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
 .v3-stat-summary { min-width: 0; padding-top: 8px; border-top: 1px solid var(--line); }
 .v3-stat-summary span, .v3-stat-summary b { display: block; overflow: hidden; margin-top: 3px; color: var(--muted); font-size: 9px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }

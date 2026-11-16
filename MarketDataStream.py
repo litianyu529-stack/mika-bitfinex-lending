@@ -1,4 +1,5 @@
 import hashlib
+import heapq
 import hmac
 import json
 import threading
@@ -12,6 +13,7 @@ from ExchangeModels import (
     parse_loan_rows,
     parse_offer_rows,
     parse_wallet_rows,
+    parse_funding_trades,
 )
 
 
@@ -47,11 +49,15 @@ class BitfinexMarketDataHub:
         fallback_seconds=300,
         rest_stale_seconds=60,
         max_trades=20_000,
+        history_service=None,
+        diagnostics=None,
     ):
         self.api_key = api_key or ""
         self.api_secret = api_secret or ""
         self.symbol = symbol
         self.store = store
+        self.history_service = history_service
+        self.diagnostics = diagnostics
         self.fallback_ms = int(fallback_seconds) * 1000
         self.rest_stale_ms = int(rest_stale_seconds) * 1000
         self.max_trades = int(max_trades)
@@ -67,7 +73,8 @@ class BitfinexMarketDataHub:
         self._credits_snapshot_ready = False
         self._loans_snapshot_ready = False
         self._book = {}
-        self._trades = deque(maxlen=self.max_trades)
+        self._trades = {}
+        self._public_trade_heap = []
         self._wallets = {}
         self._offers = {}
         self._credits = {}
@@ -76,7 +83,11 @@ class BitfinexMarketDataHub:
         self._public_connected = False
         self._auth_connected = False
         self._public_last_message_ms = None
+        self._public_book_message_ms = None
+        self._public_trade_message_ms = None
         self._auth_last_message_ms = None
+        self.offer_update_event = threading.Event()
+        self._offer_updated_at_ms = None
         self._public_disconnected_since_ms = None
         self._auth_disconnected_since_ms = None
         self._rest_last_sync_ms = None
@@ -128,6 +139,8 @@ class BitfinexMarketDataHub:
                 delay = 1
             except Exception as exc:
                 self._set_connected(channel, False, exc)
+                if self.diagnostics is not None and not self._stop.is_set():
+                    self.diagnostics.failed(f"ws_{channel}", exc)
                 if self._stop.wait(delay):
                     break
                 delay = min(30, delay * 2)
@@ -140,6 +153,8 @@ class BitfinexMarketDataHub:
             self._public_generation += 1
             self._public_channels = {}
             self._book_snapshot_ready = False
+            self._public_book_message_ms = None
+            self._public_trade_message_ms = None
             self._public_connected = False
         with websocket_connect(
             PUBLIC_WS_URL, open_timeout=15, close_timeout=3, ping_interval=20, ping_timeout=20
@@ -158,9 +173,13 @@ class BitfinexMarketDataHub:
             )
             socket.send(json.dumps({"event": "subscribe", "channel": "trades", "symbol": self.symbol}))
             self._set_connected("public", True)
+            awaiting_snapshot = self.diagnostics is not None
             while not self._stop.is_set():
                 message = socket.recv(timeout=30)
                 self.handle_public_message(message)
+                if awaiting_snapshot and self._book_snapshot_ready:
+                    self.diagnostics.connected("ws_public")
+                    awaiting_snapshot = False
 
     def _run_auth(self):
         self._run_forever("auth", self._auth_session)
@@ -168,6 +187,7 @@ class BitfinexMarketDataHub:
     def _auth_session(self):
         with self._lock:
             self._auth_generation += 1
+            self._offer_updated_at_ms = None
             self._wallet_snapshot_ready = False
             self._offers_snapshot_ready = False
             self._credits_snapshot_ready = False
@@ -206,7 +226,14 @@ class BitfinexMarketDataHub:
                 elif message.get("event") == "error":
                     self._last_error = str(message.get("msg") or message)[:500]
                 return
-            if not isinstance(message, list) or len(message) < 2 or message[1] == "hb":
+            if not isinstance(message, list) or len(message) < 2:
+                return
+            if message[1] == "hb":
+                channel = self._public_channels.get(message[0])
+                if channel == "book" and self._public_book_message_ms is not None:
+                    self._public_book_message_ms = now
+                elif channel == "trades" and self._public_trade_message_ms is not None:
+                    self._public_trade_message_ms = now
                 return
             channel = self._public_channels.get(int(message[0]))
             if channel == "book":
@@ -219,6 +246,10 @@ class BitfinexMarketDataHub:
                     self._apply_book_entry(entry)
                 if is_snapshot:
                     self._book_snapshot_ready = True
+                if self._book_snapshot_ready and any(
+                    isinstance(entry, (list, tuple)) and len(entry) >= 4 for entry in entries
+                ):
+                    self._public_book_message_ms = now
             elif channel == "trades":
                 if len(message) >= 3 and message[1] in {"fte", "ftu", "te", "tu"}:
                     entries = [message[2]]
@@ -229,7 +260,7 @@ class BitfinexMarketDataHub:
                         else [message[1]]
                     )
                 for entry in entries:
-                    self._apply_public_trade(entry)
+                    self._apply_public_trade(entry, now)
 
     def _apply_book_entry(self, entry):
         if not isinstance(entry, (list, tuple)) or len(entry) < 4:
@@ -242,32 +273,48 @@ class BitfinexMarketDataHub:
         else:
             self._book[key] = {"rate": rate, "period": period, "count": count, "amount": amount}
 
-    def _apply_public_trade(self, entry):
+    def _apply_public_trade(self, entry, now):
         if not isinstance(entry, (list, tuple)) or len(entry) < 5:
             return
-        trade = {
-            "id": str(entry[0]),
-            "mts": int(entry[1]),
-            "amount": abs(_as_decimal(entry[2])),
-            "rate": _as_decimal(entry[3]),
-            "period": int(entry[4]),
-        }
+        parsed = parse_funding_trades([entry])
+        if not parsed:
+            return
+        trade = parsed[0]
         self._merge_trades([trade])
-        if self.store is not None:
+        self._public_trade_message_ms = now
+        if self.history_service is not None:
+            self.history_service.ingest([trade], observed_at_ms=now, source="WEBSOCKET")
+        elif self.store is not None:
             self.store.upsert_market_trades([trade])
 
     def _merge_trades(self, trades):
         """Merge public funding trades by id and retain the newest bounded set."""
-        merged = {str(row["id"]): dict(row) for row in self._trades if row.get("id") is not None}
         for row in trades or []:
             normalized = dict(row)
             normalized["id"] = str(normalized["id"])
             normalized["amount"] = abs(D(normalized["amount"]))
             normalized["rate"] = D(normalized["rate"])
             normalized["mts"] = int(normalized["mts"])
-            merged[normalized["id"]] = normalized
-        newest = sorted(merged.values(), key=lambda row: (int(row["mts"]), str(row["id"])))
-        self._trades = deque(newest[-self.max_trades :], maxlen=self.max_trades)
+            previous = self._trades.get(normalized["id"])
+            self._trades[normalized["id"]] = normalized
+            if previous is None or int(previous["mts"]) != normalized["mts"]:
+                heapq.heappush(self._public_trade_heap, (normalized["mts"], normalized["id"]))
+        # Sorting belongs to snapshots. Heap eviction bounds memory even when
+        # callers stop taking snapshots, without sorting inside event callbacks.
+        if len(self._trades) > max(self.max_trades * 2, self.max_trades + 1000):
+            while len(self._trades) > self.max_trades and self._public_trade_heap:
+                mts, trade_id = heapq.heappop(self._public_trade_heap)
+                row = self._trades.get(trade_id)
+                if row is not None and int(row["mts"]) == mts:
+                    self._trades.pop(trade_id)
+
+    def _trim_public_trades(self):
+        newest = sorted(self._trades.values(), key=lambda row: (int(row["mts"]), str(row["id"])))
+        newest = newest[-self.max_trades:]
+        self._trades = {str(row["id"]): row for row in newest}
+        self._public_trade_heap = [(int(row["mts"]), str(row["id"])) for row in newest]
+        heapq.heapify(self._public_trade_heap)
+        return newest
 
     def _merge_funding_trades(self, trades):
         """Merge authenticated funding trades by id without double-counting updates."""
@@ -293,6 +340,11 @@ class BitfinexMarketDataHub:
                     else:
                         self._auth_connected = False
                         self._last_error = f"auth failed: {message.get('code', 'unknown')}"
+                    if self.diagnostics is not None:
+                        if self._auth_connected:
+                            self.diagnostics.connected("ws_auth")
+                        else:
+                            self.diagnostics.failed("ws_auth", None, code=message.get("code"))
                 return
             if not isinstance(message, list) or len(message) < 2 or message[0] != 0:
                 return
@@ -305,9 +357,13 @@ class BitfinexMarketDataHub:
                 self._offers_snapshot_ready = True
             elif event in {"fon", "fou"} and payload:
                 offer = self._parse_offer(payload)
-                self._offers[offer["id"]] = offer
+                if offer and offer != self._offers.get(offer["id"]):
+                    self._offers[offer["id"]] = offer
+                    self._note_offer_update(offer, now)
             elif event == "foc" and payload:
-                self._offers.pop(int(payload[0]), None)
+                offer = self._offers.pop(int(payload[0]), None)
+                if offer:
+                    self._note_offer_update(offer, now)
             elif event == "fcs":
                 self._credits = {int(row[0]): self._parse_credit(row) for row in payload or [] if len(row) >= 13}
                 self._credits_snapshot_ready = True
@@ -333,6 +389,15 @@ class BitfinexMarketDataHub:
                 self._wallets[self._wallet_key(payload)] = self._parse_wallet(payload)
             elif event in {"fte", "ftu"} and payload:
                 self._merge_funding_trades([self._parse_funding_trade(payload)])
+
+    def _note_offer_update(self, offer, now_ms):
+        if self._auth_connected and offer["currency"] == self.symbol.upper().removeprefix("F"):
+            self._offer_updated_at_ms = now_ms
+            self.offer_update_event.set()
+
+    def offer_updated_at_ms(self):
+        with self._lock:
+            return self._offer_updated_at_ms if self._auth_connected else None
 
     @staticmethod
     def _wallet_key(row):
@@ -377,6 +442,7 @@ class BitfinexMarketDataHub:
         with self._lock:
             if book is not None:
                 self._book = {}
+                self._public_book_message_ms = None
                 for entry in book:
                     if isinstance(entry, dict):
                         rate, period, amount = D(entry["rate"]), int(entry["period"]), D(entry["amount"])
@@ -414,8 +480,27 @@ class BitfinexMarketDataHub:
                     for row in loans
                 }
             self._rest_last_sync_ms = now
-        if self.store is not None and trades:
+        if self.history_service is not None:
+            self.history_service.ingest(trades or [], observed_at_ms=now, source="REST")
+        elif self.store is not None and trades:
             self.store.upsert_market_trades(trades)
+
+    def book_observation(self, now_ms=None):
+        """Capture the current public book without requiring a private account snapshot."""
+        with self._lock:
+            now = int(now_ms if now_ms is not None else _now_ms())
+            last = self._public_book_message_ms
+            if (not self._public_connected or not self._book_snapshot_ready or not self._book
+                    or last is None or not 0 <= now - last < 60_000):
+                return None
+            return now, [dict(row) for row in self._book.values()]
+
+    def fresh_public_trade_generation(self, now_ms):
+        with self._lock:
+            message_at = self._public_trade_message_ms
+            if self._public_connected and message_at is not None and 0 <= now_ms - message_at < 60_000:
+                return self._public_generation
+            return None
 
     def snapshot(self, now_ms=None):
         now = int(now_ms if now_ms is not None else _now_ms())
@@ -472,12 +557,13 @@ class BitfinexMarketDataHub:
                 "walletAvailableReady": wallet_available_ready if self.api_key else None,
                 "publicAgeMs": public_age,
                 "authAgeMs": auth_age,
+                "offerUpdatedAt": self._offer_updated_at_ms if self._auth_connected else None,
                 "restAgeMs": rest_age,
                 "disconnectedForMs": disconnected_for,
                 "safeRequired": bool(disconnected_for >= self.fallback_ms or (not ws_healthy and not rest_fresh)),
                 "lastError": self._last_error,
                 "book": [dict(row) for row in self._book.values()],
-                "trades": [dict(row) for row in self._trades],
+                "trades": [dict(row) for row in self._trim_public_trades()],
                 "wallets": [dict(row) for row in self._wallets.values()],
                 "offers": [dict(row) for row in self._offers.values()],
                 "credits": [dict(row) for row in self._credits.values()],

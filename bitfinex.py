@@ -8,10 +8,13 @@ import time
 from decimal import Decimal
 from urllib import error, parse, request
 
+from email.utils import parsedate_to_datetime
+from math import ceil
+
 from DomainTypes import WriteOutcome, WriteResult
 
 
-APP_VERSION = "0.3.5.2"
+APP_VERSION = "0.3.6.2"
 
 
 class BitfinexApiError(Exception):
@@ -39,13 +42,66 @@ class BitfinexAmbiguousWriteError(BitfinexApiError):
 
 
 class BitfinexTransientError(BitfinexApiError):
-    def __init__(self, message, *, category="NETWORK_TRANSPORT", status_code=None):
+    def __init__(self, message, *, category="NETWORK_TRANSPORT", status_code=None, retry_after_seconds=0):
         super().__init__(message, retryable=True, category=category, status_code=status_code)
+        self.retry_after_seconds = retry_after_seconds
 
 
 FUNDING_OFFER_TYPES = {"LIMIT", "FRR", "FRRDELTAFIX", "FRRDELTAVAR"}
 HIDDEN_OFFER_FLAG = 64
 READ_RETRY_DELAYS = (0.25, 1.0)
+
+_PUBLIC_ENDPOINTS = {
+    "book": "funding_book",
+    "trades": "funding_trades",
+    "funding": "funding_stats",
+    "ticker": "ticker",
+}
+_AUTH_ENDPOINTS = {
+    ("wallets",): "wallets",
+    ("permissions",): "key_permissions",
+    ("ledgers",): "ledgers",
+    ("funding", "offers"): "funding_offers",
+    ("funding", "loans"): "funding_loans",
+    ("funding", "credits"): "funding_credits",
+    ("funding", "trades"): "funding_trades",
+    ("info", "funding"): "funding_info",
+    ("transfer",): "wallet_transfer",
+    ("funding", "offer", "submit"): "submit_funding_offer",
+    ("funding", "offer", "cancel"): "cancel_funding_offer",
+    ("funding", "offer", "cancel", "all"): "cancel_all_funding_offers",
+}
+
+
+def _auth_endpoint(path):
+    parts = tuple(path.split("/")[3:])
+    endpoint = _AUTH_ENDPOINTS.get(parts) or _AUTH_ENDPOINTS.get(parts[:2]) or _AUTH_ENDPOINTS.get(parts[:1])
+    if endpoint is None:
+        return "other"
+    return f"{endpoint}_history" if parts[-1] == "hist" else endpoint
+
+
+def _rest_attempt(endpoint, started, attempt):
+    return {
+        "endpoint": endpoint,
+        "request_attempt": attempt + 1,
+        "request_elapsed_ms": round((time.monotonic() - started) * 1000),
+    }
+
+
+def _retry_after_seconds(value):
+    if not value:
+        return 0
+    value = value.strip()
+    try:
+        if value.isascii() and value.isdecimal():
+            return min(int(value), 2_147_483_647)
+        when = parsedate_to_datetime(value)
+        if when.tzinfo is not None:
+            return max(0, ceil(when.timestamp() - time.time()))
+    except (ValueError, OverflowError, OSError):
+        pass
+    return 0
 
 
 def _write_rejection_category(message):
@@ -66,12 +122,14 @@ class Bitfinex:
         timeout=30,
         read_retry_delays=READ_RETRY_DELAYS,
         retry_sleeper=time.sleep,
+        diagnostics=None,
     ):
         self.api_key = api_key or ""
         self.api_secret = api_secret or ""
         self.timeout = timeout
         self.read_retry_delays = tuple(float(delay) for delay in read_retry_delays)
         self.retry_sleeper = retry_sleeper
+        self.diagnostics = diagnostics
         self._last_nonce = 0
         # Bitfinex nonces are scoped to an API key.  Keep nonce creation and the
         # corresponding authenticated request in one critical section so a
@@ -117,6 +175,13 @@ class Bitfinex:
         body = self._body(payload)
         return self._headers(path, nonce, body)
 
+    def _record_rest_failure(self, channel, endpoint, exc, started, attempt, will_retry):
+        details = _rest_attempt(endpoint, started, attempt)
+        if not will_retry:
+            exc.rest_request = {"rest_channel": channel, **details}
+        if self.diagnostics is not None:
+            self.diagnostics.failed(channel, exc, rest={**details, "will_retry": will_retry})
+
     def _request_json(self, url, method="GET", data=None, headers=None, ambiguous_on_failure=False):
         """Return one JSON response, retrying only requests known to be read-only.
 
@@ -130,19 +195,35 @@ class Bitfinex:
         # Authenticated retries must generate a new nonce and signature, so
         # ``_auth_post`` owns that retry loop instead of reusing these headers.
         delays = () if ambiguous_on_failure or authenticated else self.read_retry_delays
+        endpoint = None
+        if not authenticated:
+            path = parse.urlsplit(url).path
+            endpoint = _PUBLIC_ENDPOINTS.get(path.split("/", 3)[2], "other") if path.startswith("/v2/") else "other"
+        started = time.monotonic()
         for attempt in range(len(delays) + 1):
             try:
-                return self._request_json_once(
+                response = self._request_json_once(
                     url,
                     method=method,
                     data=data,
                     headers=headers,
                     ambiguous_on_failure=ambiguous_on_failure,
                 )
-            except BitfinexTransientError:
-                if attempt >= len(delays):
+            except BitfinexApiError as exc:
+                will_retry = (isinstance(exc, BitfinexTransientError) and exc.status_code != 429
+                              and attempt < len(delays))
+                if endpoint is not None:
+                    self._record_rest_failure("rest_public", endpoint, exc, started, attempt, will_retry)
+                if not will_retry:
                     raise
                 self.retry_sleeper(delays[attempt])
+            else:
+                if endpoint is not None and self.diagnostics is not None:
+                    self.diagnostics.connected("rest_public", rest=_rest_attempt(endpoint, started, attempt))
+                return response
+
+    def _open_request(self, req):
+        return request.urlopen(req, timeout=self.timeout)
 
     def _request_json_once(self, url, method="GET", data=None, headers=None, ambiguous_on_failure=False):
         data_bytes = None
@@ -155,7 +236,7 @@ class Bitfinex:
         request_headers.update(headers or {})
         req = request.Request(url, data=data_bytes, headers=request_headers, method=method)
         try:
-            with request.urlopen(req, timeout=self.timeout) as response:
+            with self._open_request(req) as response:
                 raw = response.read().decode("utf-8")
         except error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
@@ -168,7 +249,11 @@ class Bitfinex:
             if ambiguous_on_failure and retryable:
                 raise BitfinexAmbiguousWriteError(message) from exc
             if retryable:
-                raise BitfinexTransientError(message, category="BITFINEX_HTTP_TRANSIENT", status_code=exc.code) from exc
+                retry_after = exc.headers.get("Retry-After") if exc.code == 429 and exc.headers else None
+                raise BitfinexTransientError(
+                    message, category="BITFINEX_HTTP_TRANSIENT", status_code=exc.code,
+                    retry_after_seconds=_retry_after_seconds(retry_after),
+                ) from exc
             category = "AUTH_PERMISSION" if exc.code in {401, 403} else "BITFINEX_HTTP"
             raise BitfinexApiError(
                 message,
@@ -202,29 +287,43 @@ class Bitfinex:
             ) from exc
         if isinstance(payload, list) and payload and payload[0] == "error":
             raise BitfinexApiError(str(payload))
+        if isinstance(payload, dict) and payload.get("error") == "ERR_RATE_LIMIT":
+            if ambiguous_on_failure:
+                raise BitfinexAmbiguousWriteError("Bitfinex returned a rate-limit error for a write")
+            raise BitfinexTransientError("Bitfinex rate limit", category="BITFINEX_HTTP_TRANSIENT", status_code=429)
         return payload
 
     def _auth_post(self, path, payload=None, ambiguous_on_failure=False):
         if not self.has_credentials():
             raise BitfinexApiError("Bitfinex API key/secret are not configured")
+        endpoint = _auth_endpoint(path)
         with self._auth_lock:
             body = self._body(payload)
             delays = () if ambiguous_on_failure else self.read_retry_delays
+            channel = "rest_write" if ambiguous_on_failure else "rest_account"
+            started = time.monotonic()
             for attempt in range(len(delays) + 1):
                 nonce = self._nonce()
                 headers = self._headers(path, nonce, body)
                 try:
-                    return self._request_json(
+                    response = self._request_json(
                         f"{self.AUTH_BASE_URL}/{path}",
                         method="POST",
                         data=body,
                         headers=headers,
                         ambiguous_on_failure=ambiguous_on_failure,
                     )
-                except BitfinexTransientError:
-                    if attempt >= len(delays):
+                except BitfinexApiError as exc:
+                    will_retry = (isinstance(exc, BitfinexTransientError) and exc.status_code != 429
+                                  and attempt < len(delays))
+                    self._record_rest_failure(channel, endpoint, exc, started, attempt, will_retry)
+                    if not will_retry:
                         raise
                     self.retry_sleeper(delays[attempt])
+                else:
+                    if self.diagnostics is not None:
+                        self.diagnostics.connected(channel, rest=_rest_attempt(endpoint, started, attempt))
+                    return response
 
     def _auth_write(self, path, payload=None):
         response = self._auth_post(path, payload, ambiguous_on_failure=True)

@@ -106,6 +106,10 @@ def migrate(source, legacy_backup, output):
                         "safe_manual=0,consistent_syncs=0"
                     )
                     target.execute("DELETE FROM recovery_state")
+                    target.execute(
+                        "INSERT INTO recovery_state(singleton,active,required_snapshots,manual_required,"
+                        "resume_pending_cycle) VALUES(1,0,2,0,0)"
+                    )
                     target.execute("DELETE FROM schema_meta WHERE key='v35_initialization_complete'")
                     # A confirmed closed source with no replacement/unknown intent
                     # is historical evidence, not authorization to submit today.

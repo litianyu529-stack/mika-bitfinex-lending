@@ -174,7 +174,7 @@ def build_strategy_settings(extra_bot=None):
 
 class BitfinexBotTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual(APP_VERSION, "0.3.5.2")
+        self.assertEqual(APP_VERSION, "0.3.6.2")
 
     def test_auth_headers_signature(self):
         client = Bitfinex("key", "secret")
@@ -581,7 +581,7 @@ class BitfinexBotTests(unittest.TestCase):
             finally:
                 FakePreflightClient.wallet_rows = original
 
-    def test_preflight_confirmed_external_offer_is_adopted_once(self):
+    def test_preflight_does_not_adopt_protected_external_offer(self):
         now_ms = 2_000_000_000_000
 
         class ExternalOfferClient(FakePreflightClient):
@@ -623,13 +623,13 @@ class BitfinexBotTests(unittest.TestCase):
                 config.write(target)
             context = lendingbot.AppContext.for_project(directory, config_path=path, client_factory=ExternalOfferClient)
             response = lendingbot.create_controlled_bot_preflight(path, now=2000, context=context)
-            assert [row["id"] for row in response["summary"]["externalAdoptionCandidates"]] == [9001]
+            assert response["summary"]["externalAdoptionCandidates"] == []
             consumed = lendingbot.consume_controlled_bot_preflight(
                 path, response["preflightId"], now=2001, context=context
             )
             store, _ = lendingbot.v3_store_for_config(path)
-            assert consumed["adoptedOfferIds"] == [9001]
-            assert store.offers(active_only=True)[0]["managed"] == 1
+            assert consumed["adoptedOfferIds"] == []
+            assert store.offers(active_only=True) == []
 
     def test_legacy_status_never_exposes_balance(self):
         with tempfile.TemporaryDirectory() as directory:
