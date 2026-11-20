@@ -1,0 +1,10 @@
+default.cfg
+.state/
+www/status.json
+*.sqlite3
+*.sqlite3-*
+__pycache__/
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/

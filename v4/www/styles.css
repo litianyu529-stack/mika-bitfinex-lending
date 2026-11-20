@@ -1,0 +1,59 @@
+:root {
+  color-scheme: dark;
+  --bg: #07100e;
+  --panel: #0e1b18;
+  --panel-2: #13231f;
+  --line: #244039;
+  --text: #f1f7f4;
+  --muted: #9bb2aa;
+  --green: #49e1a7;
+  --amber: #f2c96d;
+  --red: #ff766d;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: radial-gradient(circle at 75% -10%, #19362e, transparent 40%), var(--bg); color: var(--text); font: 15px/1.5 Inter, "Microsoft YaHei", sans-serif; }
+header, main { width: min(1240px, calc(100% - 32px)); margin: 0 auto; }
+header { display: flex; justify-content: space-between; gap: 24px; align-items: center; padding: 42px 0 24px; }
+h1, h2, p { margin-top: 0; }
+h1 { font-size: clamp(28px, 4vw, 46px); margin-bottom: 8px; letter-spacing: -.04em; }
+h2 { font-size: 18px; margin: 0; }
+.eyebrow { margin-bottom: 8px; color: var(--green); letter-spacing: .18em; font-size: 12px; font-weight: 800; }
+.muted, small, .panel-title span { color: var(--muted); }
+.mode-box { display: grid; gap: 8px; justify-items: end; }
+.badge { display: inline-flex; padding: 5px 11px; border-radius: 99px; background: var(--green); color: #06130f; font-weight: 800; font-size: 12px; }
+.badge.safe { background: var(--red); color: #250200; }
+.badge.shadow, .badge.neutral { background: var(--amber); color: #241a02; }
+.alert { display: flex; gap: 12px; padding: 15px 18px; margin-bottom: 18px; border: 1px solid #9f3b35; border-radius: 12px; background: #351413; color: #ffd2cf; }
+.hidden { display: none; }
+.metrics { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 18px; }
+.metrics article, .panel { border: 1px solid var(--line); background: linear-gradient(155deg, var(--panel-2), var(--panel)); border-radius: 14px; box-shadow: 0 14px 45px #0004; }
+.metrics article { min-height: 122px; display: flex; flex-direction: column; padding: 18px; }
+.metrics article span { color: var(--muted); }
+.metrics strong { margin-top: auto; font-size: 24px; }
+.grid.two { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.panel { margin-bottom: 18px; padding: 20px; }
+.panel-title { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 18px; }
+dl { display: grid; grid-template-columns: 1fr auto; gap: 9px 20px; margin: 0; }
+dt { color: var(--muted); } dd { margin: 0; font-variant-numeric: tabular-nums; }
+.actions, .form-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+button { border: 1px solid var(--line); border-radius: 8px; padding: 9px 14px; color: var(--text); background: #172823; cursor: pointer; font-weight: 700; }
+button:hover { border-color: var(--green); }
+button.primary { background: #167654; border-color: #229b71; }
+button.danger { background: #6f2824; border-color: #a5413a; }
+.message { margin: 12px 0 0; color: var(--amber); min-height: 22px; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { padding: 11px 10px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+.form-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+label { display: grid; gap: 6px; color: var(--muted); font-size: 13px; }
+input { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #08130f; color: var(--text); }
+label.check { display: flex; grid-column: span 2; align-items: center; flex-direction: row; }
+label.check input { width: auto; }
+.form-actions { grid-column: 1 / -1; }
+.events { list-style: none; margin: 0; padding: 0; }
+#externalOffers { white-space: pre-line; margin-bottom: 14px; }
+#adoptForm input { max-width: 420px; }
+.events li { display: grid; grid-template-columns: 170px 160px 1fr; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+@media (max-width: 1000px) { .metrics { grid-template-columns: repeat(3, 1fr); } .form-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 680px) { header, .grid.two { display: grid; grid-template-columns: 1fr; } .mode-box { justify-items: start; } .metrics { grid-template-columns: repeat(2, 1fr); } .form-grid { grid-template-columns: 1fr; } label.check { grid-column: auto; } .events li { grid-template-columns: 1fr; } }

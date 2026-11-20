@@ -1,0 +1,37 @@
+# Mika Lending Bot V4 独立配置。凭据优先读取环境变量：
+# BITFINEX_API_KEY / BITFINEX_API_SECRET
+[BITFINEX]
+apikey =
+secret =
+
+[BOT_V4]
+fast_sync_seconds = 60
+full_replan_seconds = 300
+market_stale_seconds = 90
+dashboard_port = 8001
+state_db = .state/lendingbot-v4.sqlite3
+status_file = www/status.json
+shadow_days = 7
+
+[STRATEGY_V4]
+short_floor_apr = 6.89
+medium_floor_apr = 8
+long_floor_apr = 10
+short_weight = 60
+medium_weight = 20
+short_periods = 2,4,7
+medium_periods = 14,30
+short_max_rungs = 5
+medium_max_rungs = 4
+grid_min_step_percent = 0.001
+grid_max_step_percent = 0.005
+partial_fill_trigger_percent = 50
+idle_merge_trigger = 5
+short_floor_stale_minutes = 60
+medium_floor_stale_minutes = 180
+long_floor_stale_minutes = 720
+max_group_rebuilds_per_hour = 6
+normal_fee_percent = 15
+max_lend_amount =
+max_lend_percent = 100
+adopt_external_offers = false
